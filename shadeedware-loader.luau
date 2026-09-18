@@ -2356,6 +2356,35 @@ local getconnections = glob("getconnections")
 local firesignal = glob("firesignal") or glob("fire_signal")
 local gethui = glob("gethui") or glob("get_hidden_gui")
 
+-- Run this file directly instead of through the loader and SHADEEDWARE_ICONS never gets set,
+-- which used to leave you with the one fallback picture and no clips -- and the rotation saved
+-- below shrank to match, wiping the queue for the next proper run too. The loader leaves a
+-- manifest of everything it wrote, so a direct run shows the same gallery the loader does.
+if not (type(SHADEEDWARE_ICONS) == "table" and #SHADEEDWARE_ICONS > 0) then
+	local rf, isf = glob("readfile"), glob("isfile")
+	local ok, manifest = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(rf("shadeed_manifest.json"))
+	end)
+	if ok and type(manifest) == "table" then
+		local function present(f)
+			if not isf then return true end
+			local okc, r = pcall(isf, f)
+			return okc and r == true
+		end
+		local icons, vids = {}, {}
+		for _, f in ipairs(type(manifest.icons) == "table" and manifest.icons or {}) do
+			if type(f) == "string" and present(f) then table.insert(icons, f) end
+		end
+		for _, v in ipairs(type(manifest.videos) == "table" and manifest.videos or {}) do
+			if type(v) == "table" and type(v.audio) == "string" and type(v.sheets) == "table" and present(v.audio) then
+				table.insert(vids, v)
+			end
+		end
+		if #icons > 0 then ICON_POOL, ICON_FILE = icons, icons[1] end
+		if #vids > 0 then VIDEO_POOL = vids end
+	end
+end
+
 -- Pictures and clips go through a shuffled cycle saved in the workspace, so nothing repeats
 -- until everything has had a turn, re-executes included.
 local CYCLE_FILE = "shadeed_cycle.json"
@@ -2604,6 +2633,8 @@ local State = {
 	autoShake = false,
 	autoCatch = false,
 	autoQuest = false,
+	chaseEvents = false,
+	antiAfk = true,
 	recastDelay = 1.4,
 	stallTimeout = 50,
 	walkToWater = true,
@@ -4312,15 +4343,11 @@ toggle(fishingPage, 5, "Walk to water", "Auto cast walks to the shore and reels 
 	notify("Walk to water " .. (v and "on" or "off"))
 end)
 
-section(fishingPage, "Timing", 6)
-slider(fishingPage, 7, "Recast delay", 0.3, 5, 1.4, "s", function(v) State.recastDelay = v end)
-slider(fishingPage, 8, "Reel in if no bite", 20, 150, 50, "s", function(v) State.stallTimeout = v end)
-
 section(fishingPage, "How it works", 9)
 note(fishingPage, 10, 70,
 	"Everything runs through Fisch's own code paths. The cast releases the real power bar, "
 	.. "the reel finishes through the game's own controller, and no remote is ever fired by hand. "
-	.. "Recast delay is a mean — the real gap is drawn around it every time.")
+	.. "Recasts come ~1.4s apart on average, and a cast with no bite is reeled in after 50s.")
 
 -- Player -------------------------------------------------------------
 section(playerPage, "Movement", 1)
@@ -4349,6 +4376,49 @@ note(playerPage, 7, 84,
 	.. "normal speed buff; 22–28 is visible but survivable; there is no safe number above that, "
 	.. "which is why the slider stops here.")
 
+section(playerPage, "Session", 8)
+
+-- Roblox drops you after 20 minutes without input, and Fisch has its own idle watch on top
+-- of that: client.legacyControllers.AntiAfkIdleController fires events.idleReport(true) the
+-- moment Player.Idled goes off, and only clears it again when UserInputService sees real
+-- input. So one nudge is not enough -- the click through VirtualUser keeps Roblox happy and
+-- is real input as far as the game is concerned, and the clear is sent straight after in
+-- case that input arrives too late to be noticed.
+do
+	local VirtualUser = game:GetService("VirtualUser")
+	local conn = nil
+
+	local function setAfk(v)
+		State.antiAfk = v
+		if v and not conn then
+			conn = LocalPlayer.Idled:Connect(function()
+				pcall(function()
+					VirtualUser:CaptureController()
+					VirtualUser:ClickButton2(Vector2.new())
+				end)
+				local report = events:FindFirstChild("idleReport")
+				if report and report:IsA("RemoteEvent") then
+					pcall(function() report:FireServer(false) end)
+				end
+			end)
+		elseif not v and conn then
+			conn:Disconnect()
+			conn = nil
+		end
+	end
+
+	-- on from the start: a toggle's callback only runs when it is clicked, so showing it as
+	-- on is not the same as it being on
+	setAfk(true)
+	-- unloading or re-running destroys the window; take the hook with it or every re-run
+	-- would leave another one behind
+	gui.Destroying:Connect(function() setAfk(false) end)
+	toggle(playerPage, 9, "Anti-AFK", "Stays connected through the 20 minute idle kick", true, function(v)
+		setAfk(v)
+		notify("Anti-AFK " .. (v and "on" or "off"))
+	end)
+end
+
 -- Quests -------------------------------------------------------------
 section(questPage, "Reputation quests", 1)
 toggle(questPage, 2, "Auto Quests", "One action per pass, ~40–145s apart", false, function(v)
@@ -4368,12 +4438,275 @@ questListLabel = new("TextLabel", {
 }, { corner(9), pad(10, 10, 12, 12) })
 
 -- Teleport -----------------------------------------------------------
--- Destinations are read live out of Workspace.zones.player, which is the game's own
--- set of named zone volumes with real world positions. Nothing is hardcoded, so the
--- list cannot go stale when Fisch moves or adds an area.
+-- The destination list is read live out of Workspace.zones.player, the game's own named
+-- zone volumes, so it can't go stale when Fisch moves or adds an area. Those volumes are
+-- only ambience triggers though: they are huge invisible boxes (every "The Deep" is a
+-- 2048-stud cube) and their centre is almost never somewhere you can stand -- it is the
+-- inside of a mountain, or a kilometre under the sea. Dropping you on one is what used to
+-- put you inside the scenery. Every destination is resolved to a real spot instead:
+--   1. Fisch's own teleport pad in world.spawns.TpSpots, matched by name
+--   2. the matching world.spawns.<Location> spawn parts
+--   3. otherwise the highest surface in the zone's own column, counting the sea
+-- and because this place has StreamingEnabled, arriving is always quicker than the
+-- destination replicating, so the character is held in the air until the ground it is
+-- meant to stand on actually exists.
 local tpReturn = nil
+local tpBusy = false
+local tpZoneParts = {} -- zone name -> every box carrying it; filled when the list is built
 
-local function teleportTo(cf, label)
+local TP_STREAM_WAIT = 6 -- seconds to let the destination replicate before setting down
+local TP_SETTLE_MIN = 1.2 -- never commit to a landing sooner than this
+local TP_STEADY = 3 -- probes in a row that have to agree before the ground is believed
+local TP_HOVER = 6 -- studs of air kept under the feet while waiting
+local TP_HEADROOM = 4 -- a surface closer than this to the probe start is one we are inside
+
+-- "Keepers Altar" and "keepersaltar" are the same place to us
+local function tpKey(s) return (string.lower(s):gsub("[^%a%d]", "")) end
+
+-- Fisch's own landing points, and the height of the sea. Both are remembered rather than
+-- looked up on demand, because streaming takes them away again: the TpSpots pads drop in
+-- and out as you move around the map, and a pad that is missing at the moment you click is
+-- the difference between arriving at a place's entrance and being dropped down its column.
+-- Nothing here ever moves, so a position once seen is good for the session.
+local tpSpots = {}
+local tpSeaY = 126
+
+local function tpRemember()
+	local world = workspace:FindFirstChild("world")
+	local spawns = world and world:FindFirstChild("spawns")
+	if spawns then
+		for _, folder in ipairs(spawns:GetChildren()) do
+			local pads = folder.Name == "TpSpots"
+			for _, p in ipairs(folder:GetDescendants()) do
+				-- a pad is named for its place; a location folder's parts are all "spawn"
+				if p:IsA("BasePart") then
+					local key = tpKey(pads and p.Name or folder.Name)
+					if key ~= "" and not tpSpots[key] then tpSpots[key] = p.Position end
+				end
+			end
+		end
+	end
+
+	-- world.water holds the two slabs that are the sea itself. Deliberately not the ocean
+	-- parts under zones.fishing: those include ponds and pools sitting well above it, and
+	-- taking the highest of the lot walks the waterline up the map every time this runs.
+	local water = world and world:FindFirstChild("water")
+	local found
+	if water then
+		for _, p in ipairs(water:GetChildren()) do
+			if p:IsA("BasePart") then
+				found = math.max(found or -math.huge, p.Position.Y + p.Size.Y / 2)
+			end
+		end
+	end
+	if found then tpSeaY = found end
+end
+
+-- HumanoidRootPart centre to sole. R6 has no HipHeight, its legs are just 2 studs.
+local function tpFeet()
+	local c, h = character(), humanoid()
+	local hrp = c and c:FindFirstChild("HumanoidRootPart")
+	if not hrp then return 3 end
+	if h and h.RigType == Enum.HumanoidRigType.R15 then return hrp.Size.Y / 2 + h.HipHeight end
+	return hrp.Size.Y / 2 + 2
+end
+
+-- The first solid thing below `from`. Reuses the caster's ray settings, which respect
+-- CanCollide -- that is what makes these rays fall straight through the invisible zone
+-- boxes instead of landing on top of them -- but unlike the caster this ignores water.
+-- Half-replicated terrain water reports a different surface every frame while it loads
+-- (-384, then -192, then -128, then 0 over four frames at Roslit Bay), so a ray is only
+-- ever asked about solid ground and the waterline is taken from tpSeaY instead.
+local function tpSurface(from, dist)
+	local rp = rayParams()
+	rp.IgnoreWater = true
+	local hit = workspace:Raycast(from, Vector3.new(0, -dist, 0), rp)
+	return hit and hit.Position.Y or nil
+end
+
+-- Walks down a column looking for a surface with room to stand on it. It probes from three
+-- heights because one is never right for every zone: start at a cave's ceiling and the ray
+-- either lands on the roof or begins inside the rock and reports nothing, start too low and
+-- you are already under the floor. The first hit far enough below the probe to be something
+-- you are standing on rather than something you are buried in wins.
+local function tpFloor(x, z, from, to)
+	local span = from - to
+	for _, frac in ipairs({ 0, 0.4, 0.75 }) do
+		local start = from - span * frac
+		local y = tpSurface(Vector3.new(x, start, z), start - to)
+		if y and start - y > TP_HEADROOM then return y end
+	end
+	return nil
+end
+
+-- Each zone box carries the flags Fisch lights it by. `underground` and `indoors` also say
+-- which way to come at it: an open one is entered from the sky so an island lands you on
+-- its grass, while a cave has to be probed from inside its own box or the ray only ever
+-- finds the rock the place is buried under.
+local function tpEnclosed(part)
+	for _, flag in ipairs({ "underground", "indoors" }) do
+		local v = part:FindFirstChild(flag)
+		if v and v:IsA("BoolValue") and v.Value then return true end
+	end
+	return false
+end
+
+-- Where a zone should put you: an exact spawn when Fisch has one, otherwise the column of
+-- one of the boxes carrying that name, which tpSettle probes once the area has streamed in.
+local function tpTarget(name, parts)
+	tpRemember()
+	local spot = tpSpots[tpKey(name)]
+	if spot then return { pos = spot, exact = true } end
+
+	-- Always the same box for a given name, rather than whichever happens to be nearest at
+	-- the time: "The Deep" alone covers 200-odd of them, and the one whose ceiling is
+	-- highest is the one closest to the surface you would have swum down from.
+	local best, bestTop
+	for _, p in ipairs(parts) do
+		if p.Parent then
+			local top = p.Position.Y + p.Size.Y / 2
+			if not bestTop or top > bestTop then best, bestTop = p, top end
+		end
+	end
+	if not best then return nil end
+	return {
+		pos = best.Position,
+		top = bestTop,
+		bottom = best.Position.Y - best.Size.Y / 2,
+		enclosed = tpEnclosed(best),
+	}
+end
+
+local function tpRelease(hrp)
+	pcall(function()
+		hrp.Anchored = false
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end)
+end
+
+-- The actual move. The character is anchored for the trip so an unloaded destination has
+-- nothing to drop it through, parked in the air above the target while the area replicates,
+-- and only then set down on whatever it found underneath.
+local function tpSettle(target, origin)
+	local c = character()
+	local hrp = c and c:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	local h = humanoid()
+	local feet = tpFeet()
+	local x, z = target.pos.X, target.pos.Z
+
+	-- Does the sea run through this zone's column? Ocean surfaces are non-collidable parts,
+	-- so no ray will ever return one, and without asking separately a deep zone puts you on
+	-- the seabed a thousand studs down instead of floating over it where you would have
+	-- swum in. A zone sealed off below the waterline, like Roslit Bay's flooded half, has
+	-- its ceiling under the sea and is left to its own floor.
+	local afloat = not target.exact
+		and target.top
+		and tpSeaY <= target.top + 2
+		and tpSeaY >= target.bottom
+
+	local wasAnchored = hrp.Anchored
+	hrp.Anchored = true
+	-- never leave it stuck in the air if anything below throws
+	task.delay(TP_STREAM_WAIT + 8, function()
+		if hrp.Parent and not wasAnchored then tpRelease(hrp) end
+	end)
+
+	-- Wait it out somewhere the area will stream in around, and somewhere survivable: over
+	-- the spot for a known spawn, over the box for anything the sea reaches or the sky can
+	-- see, and in the middle of the box for a sealed cave, whose ceiling we would otherwise
+	-- be sitting inside.
+	local hoverY
+	if target.exact then
+		hoverY = target.pos.Y + TP_HOVER
+	elseif target.enclosed and not afloat then
+		hoverY = (target.top + target.bottom) / 2
+	else
+		hoverY = target.top + TP_HOVER
+	end
+	local park = CFrame.new(x, hoverY + feet, z)
+	hrp.CFrame = park
+	hrp.AssemblyLinearVelocity = Vector3.zero
+
+	-- Keep probing until the answer stops moving. Taking the first surface that turns up is
+	-- how you end up underwater: before an island has replicated, its column reads straight
+	-- through to the ocean floor part, which is loaded everywhere and looks like perfectly
+	-- good ground. The real one only appears a moment later and then stays put.
+	local floorY, wet, steady = nil, nil, 0
+	local started = os.clock()
+	local deadline = started + TP_STREAM_WAIT
+	repeat
+		task.wait(0.15)
+		if not hrp.Parent then return false end
+		hrp.CFrame = park -- hold it; streaming only runs around where the character is
+		hrp.AssemblyLinearVelocity = Vector3.zero
+
+		local y, w
+		if target.exact then
+			y = tpSurface(Vector3.new(x, hoverY, z), TP_HOVER + 24)
+		elseif target.enclosed and not afloat then
+			y = tpFloor(x, z, target.top, target.bottom)
+		else
+			y = tpFloor(x, z, target.top + 200, target.bottom)
+		end
+		-- the sea is a surface too, and the higher of the two is the one you meet first
+		if afloat and (not y or tpSeaY > y) then y, w = tpSeaY, true end
+
+		if y and floorY and math.abs(y - floorY) < 2 then steady += 1 else steady = 0 end
+		if y then floorY, wet = y, w end
+	until (steady >= TP_STEADY and os.clock() - started > TP_SETTLE_MIN) or os.clock() > deadline
+
+	local landed
+	if target.body and (not floorY or target.pos.Y - floorY > 6) then
+		-- A person rather than a spot, and not standing on anything: swimming, on a boat that
+		-- has moved on, or mid-jump. Arrive at their height instead of on the seabed under
+		-- them, and if that is in the sea, float there like they are.
+		landed = CFrame.new(x, target.pos.Y, z)
+		wet = target.pos.Y <= tpSeaY + 3
+	elseif floorY then
+		-- water gets a touch more clearance so you bob on the surface rather than in it
+		landed = CFrame.new(x, floorY + feet + (wet and 1 or 0.5), z)
+	elseif target.exact then
+		landed = CFrame.new(x, target.pos.Y + feet, z)
+	end
+
+	-- Don't let go until something is actually holding it up. A cave floor that never
+	-- replicated will let the character drop straight out of the world, and that is a death
+	-- and a respawn rather than a teleport -- which is how the old one lost you entirely.
+	-- Water is taken on trust: a ray starting inside it reports nothing to stand on.
+	if landed and not wet then
+		local supported = false
+		local giveUp = os.clock() + 3
+		repeat
+			task.wait(0.15)
+			if not hrp.Parent then return false end
+			hrp.CFrame = landed
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			supported = tpSurface(landed.Position, feet + 60) ~= nil
+		until supported or os.clock() > giveUp
+		if not supported then landed = nil end
+	end
+
+	if landed then
+		hrp.CFrame = landed
+	else
+		-- nothing under it and nothing loaded: leave it where it started rather than drop it
+		hrp.CFrame = origin
+	end
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+
+	task.wait(wet and 0.8 or 0.05) -- afloat: hold on until the water itself has replicated
+	if not wasAnchored then tpRelease(hrp) end
+	if h then pcall(function() h:ChangeState(Enum.HumanoidStateType.Freefall) end) end
+	return landed ~= nil
+end
+
+-- `resolve` is deferred so the destination is worked out at click time, against whatever
+-- has streamed in by then rather than whatever existed when the menu was built. It may
+-- return a reason instead of a target when there is nothing to aim at. True if it moved.
+local function teleportTo(label, resolve)
 	local c = character()
 	local hrp = c and c:FindFirstChild("HumanoidRootPart")
 	if not hrp then
@@ -4384,6 +4717,10 @@ local function teleportTo(cf, label)
 		notify("Not while a fish is on the line", T.warn)
 		return
 	end
+	if tpBusy then
+		notify("Still landing", T.warn)
+		return
+	end
 
 	local h = humanoid()
 	if h and h.SeatPart then
@@ -4391,77 +4728,361 @@ local function teleportTo(cf, label)
 		task.wait(0.15)
 	end
 
-	tpReturn = hrp.CFrame
-	hrp.CFrame = cf
-	hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-	hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-	if label then notify("→ " .. label) end
+	local target, why = resolve()
+	if not target then
+		notify(why or "Nowhere to land there", T.danger)
+		return
+	end
+
+	tpBusy = true
+	local from = hrp.CFrame
+	local ok, moved = pcall(tpSettle, target, from)
+	tpBusy = false
+	if not ok then
+		-- tpSettle anchors the character before it moves it, so dying halfway through would
+		-- otherwise leave you frozen in mid-air until its watchdog lets go
+		warn("[ShadeedWare] teleport failed: " .. tostring(moved))
+		pcall(function()
+			hrp.CFrame = from
+			tpRelease(hrp)
+		end)
+		notify("Teleport failed", T.danger)
+		return
+	end
+	if not moved then
+		-- tpSettle put it back: the destination never replicated, so there was nothing to
+		-- stand on. Clicking again from closer in almost always takes.
+		notify((label or "That place") .. " didn't load — stayed put", T.warn)
+		return
+	end
+	tpReturn = from
+	if label then notify("-> " .. label) end
+	return true
 end
 
-section(teleportPage, "Destinations", 1)
+-- Players -------------------------------------------------------------
+-- This place has StreamingEnabled, and anyone past your streaming radius keeps their
+-- Player.Character but has it parented to nil and frozen, often with no HumanoidRootPart
+-- at all. The first version read the root part and gave up on anyone who wasn't already
+-- near you, which in a full server is nearly everyone. So going to a player is a short
+-- hunt: the island the server says they last reached, then where their character was last
+-- seen, and after each hop a wait for them to stream in so the last step lands on them.
+do
+	section(teleportPage, "Players", 1)
+
+	local search = new("TextBox", {
+		Parent = teleportPage, LayoutOrder = 2, Size = UDim2.new(1, -6, 0, 32),
+		BackgroundColor3 = T.panel, Text = "", PlaceholderText = "search players…",
+		PlaceholderColor3 = T.muted, ClearTextOnFocus = false,
+		Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, { corner(9), stroke(T.stroke, 1, 0.45), pad(0, 0, 10, 10) })
+
+	local empty = new("TextLabel", {
+		Parent = teleportPage, LayoutOrder = 3, Size = UDim2.new(1, -6, 0, 24),
+		BackgroundTransparency = 1, Text = "",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = T.muted,
+	})
+
+	-- where they are right now, if they are streamed in around us
+	local function liveSpot(p)
+		local c = p.Character
+		local hrp = c and c:FindFirstChild("HumanoidRootPart")
+		if hrp and c:IsDescendantOf(workspace) then
+			-- a few studs behind them, so you arrive next to them and not inside them
+			return hrp.Position - hrp.CFrame.LookVector * 4
+		end
+	end
+
+	-- where their detached character was when it last updated
+	local function lastSeen(p)
+		local c = p.Character
+		if not c then return nil end
+		local hrp = c:FindFirstChild("HumanoidRootPart")
+		if hrp then return hrp.Position end
+		local ok, cf = pcall(c.GetPivot, c)
+		if ok and cf.Position.Magnitude > 1 then return cf.Position end
+	end
+
+	-- Fisch keeps LastIsland on every Player ("Roslit", "Snowcap", ...): that island's own
+	-- spawn if we have seen it, otherwise the zone whose name starts with it
+	local function islandTarget(island)
+		local key = type(island) == "string" and tpKey(island) or ""
+		if key == "" or key == "none" then return nil end
+		tpRemember()
+		if tpSpots[key] then return { pos = tpSpots[key], exact = true } end
+		local best
+		for name in pairs(tpZoneParts) do
+			if string.sub(tpKey(name), 1, #key) == key and (not best or #name < #best) then best = name end
+		end
+		return best and tpTarget(best, tpZoneParts[best])
+	end
+
+	local hunting = false
+	local function goTo(p)
+		if hunting then
+			notify("Already looking for someone", T.warn)
+			return
+		end
+		local name = p.DisplayName
+		local here = liveSpot(p)
+		if here then
+			teleportTo(name, function() return { pos = here, exact = true, body = true } end)
+			return
+		end
+
+		-- The island goes first. The server keeps it current as they move between islands,
+		-- while a frozen character only says where they were whenever the two of you last
+		-- drifted apart: tested on a player whose was a cave they had left minutes earlier,
+		-- and whose LastIsland had them 118 studs from its spawn.
+		local hops = {}
+		local island = p:GetAttribute("LastIsland")
+		local byIsland = islandTarget(island)
+		if byIsland then hops[#hops + 1] = { label = tostring(island), target = byIsland } end
+		local seen = lastSeen(p)
+		-- anything that close to the island streams in from there, so it needs no hop of its own
+		if seen and not (byIsland and (byIsland.pos - seen).Magnitude < 1000) then
+			hops[#hops + 1] = { label = "last seen", target = { pos = seen, exact = true, body = true } }
+		end
+		if #hops == 0 then
+			notify("No idea where " .. name .. " is yet", T.warn)
+			return
+		end
+
+		hunting = true
+		local start = rootPart() and rootPart().CFrame
+		local moved = false
+		for _, hop in ipairs(hops) do
+			if not p.Parent then break end
+			notify("Looking for " .. name .. " (" .. hop.label .. ")")
+			if not teleportTo(nil, function() return hop.target end) then break end
+			moved = true
+			-- Other characters stream in slowly after a long teleport: the one above took 13s
+			-- to appear while standing 118 studs away. Stop the moment they do, and give up on
+			-- the whole hunt if you have teleported off somewhere else in the meantime.
+			local landedAt = rootPart() and rootPart().Position
+			local giveUp = os.clock() + 15
+			local wandered = false
+			repeat
+				task.wait(0.25)
+				here = liveSpot(p)
+				local r = rootPart()
+				wandered = landedAt ~= nil and r ~= nil and (r.Position - landedAt).Magnitude > 250
+			until here or wandered or os.clock() > giveUp or not p.Parent
+			if wandered then
+				hunting = false
+				return
+			end
+			if here then
+				teleportTo(name, function() return { pos = here, exact = true, body = true } end)
+				break
+			end
+		end
+		hunting = false
+		-- "Return to previous position" should undo the whole hunt, not just its last hop
+		if moved and start then tpReturn = start end
+
+		if not here then
+			if not p.Parent then
+				notify(name .. " left the server", T.warn)
+			else
+				notify("Couldn't find " .. name .. " — they're out of range", T.warn)
+			end
+		end
+	end
+
+	local rows = {}
+	local function applyFilter()
+		local q = string.lower(search.Text)
+		local shown = 0
+		for _, r in ipairs(rows) do
+			r.btn.Visible = q == "" or string.find(r.key, q, 1, true) ~= nil
+			if r.btn.Visible then shown += 1 end
+		end
+		empty.Visible = shown == 0
+		empty.Text = #rows == 0 and "nobody else in this server" or "no one called that"
+	end
+
+	local function refresh()
+		for _, r in ipairs(rows) do r.btn:Destroy() end
+		table.clear(rows)
+
+		local others = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LocalPlayer then others[#others + 1] = p end
+		end
+		table.sort(others, function(a, b) return string.lower(a.Name) < string.lower(b.Name) end)
+
+		for i, p in ipairs(others) do
+			local b = new("TextButton", {
+				Parent = teleportPage, LayoutOrder = 3 + i, Size = UDim2.new(1, -6, 0, 30),
+				BackgroundColor3 = T.panel, BackgroundTransparency = 0.28,
+				AutoButtonColor = false, Text = "",
+			}, { corner(8), stroke(T.stroke, 1, 0.55) })
+			new("TextLabel", {
+				Parent = b, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(10, 0),
+				BackgroundTransparency = 1,
+				Text = p.DisplayName == p.Name and p.Name or (p.DisplayName .. "  @" .. p.Name),
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.text,
+			})
+			b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.panel2 }) end)
+			b.MouseLeave:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.panel }) end)
+			b.MouseButton1Click:Connect(function() task.spawn(goTo, p) end)
+			-- username and display name both, since the leaderboard only shows the display one
+			rows[#rows + 1] = { btn = b, key = string.lower(p.Name .. " " .. p.DisplayName), player = p }
+		end
+		applyFilter()
+	end
+
+	search:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+	-- Enter with exactly one match goes straight to them
+	search.FocusLost:Connect(function(enter)
+		if not enter then return end
+		local only
+		for _, r in ipairs(rows) do
+			if r.btn.Visible then
+				if only then return end
+				only = r.player
+			end
+		end
+		if only then task.spawn(goTo, only) end
+	end)
+
+	refresh()
+	Players.PlayerAdded:Connect(function() task.defer(refresh) end)
+	Players.PlayerRemoving:Connect(function() task.defer(refresh) end)
+end
+
+-- Server events -------------------------------------------------------
+-- Fisch announces a spawn to the whole server over events.anno_serverEvent, and the
+-- plainer events.anno_top, whose first argument is the banner text you see at the top of
+-- the screen -- "A Great White has spawned in Vertigo!" and the like. Rather than match
+-- that sentence, which is worded differently per event and gets rewritten between updates,
+-- the text is searched for any place already in the destination list below. Longest match
+-- wins so "Roslit Bay" beats a zone called "Roslit".
+do
+	section(teleportPage, "Server events", 70)
+	local lastHop = 0
+
+	local function placeIn(text)
+		local hay = " " .. string.lower(text) .. " "
+		local best, bestLen
+		for name in pairs(tpZoneParts) do
+			local n = string.lower(name)
+			-- three letters or fewer matches half the alphabet by accident
+			if #n > 3 and string.find(hay, n, 1, true) and (not bestLen or #n > bestLen) then
+				best, bestLen = name, #n
+			end
+		end
+		return best
+	end
+
+	local function chase(text)
+		if not State.chaseEvents or type(text) ~= "string" then return end
+		-- the same spawn comes in on both remotes; one hop per event is plenty
+		if os.clock() - lastHop < 25 then return end
+		local place = placeIn(text)
+		if not place then return end
+		lastHop = os.clock()
+
+		task.spawn(function()
+			notify("Event at " .. place .. " — heading over")
+			teleportTo(place, function() return tpTarget(place, tpZoneParts[place]) end)
+			if not State.chaseEvents then return end
+			-- hand over to the normal automation, which is the part that already knows how
+			-- to find a shore, face it and keep casting
+			State.walkToWater = true
+			if setCast then setCast(true) end
+			if setShake then setShake(true) end
+			if setCatch then setCatch(true) end
+			task.wait(0.4)
+			goToWater("Walking to the water at " .. place)
+		end)
+	end
+
+	toggle(teleportPage, 71, "Chase server events",
+		"Teleports to announced spawns, walks to the water and starts fishing", false, function(v)
+			State.chaseEvents = v
+			notify("Chase server events " .. (v and "on" or "off"))
+		end)
+
+	for _, name in ipairs({ "anno_serverEvent", "anno_top" }) do
+		local ev = events:FindFirstChild(name)
+		if ev and ev:IsA("RemoteEvent") then ev.OnClientEvent:Connect(chase) end
+	end
+end
+
+-- Destinations --------------------------------------------------------
+section(teleportPage, "Destinations", 100)
 
 local tpSearch = new("TextBox", {
-	Parent = teleportPage, LayoutOrder = 2, Size = UDim2.new(1, -6, 0, 32),
+	Parent = teleportPage, LayoutOrder = 101, Size = UDim2.new(1, -6, 0, 32),
 	BackgroundColor3 = T.panel, Text = "", PlaceholderText = "search…",
 	PlaceholderColor3 = T.muted, ClearTextOnFocus = false,
 	Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.text,
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, { corner(9), stroke(T.stroke, 1, 0.45), pad(0, 0, 10, 10) })
 
-button(teleportPage, 3, "Return to previous position", function()
+button(teleportPage, 102, "Return to previous position", function()
 	if not tpReturn then
 		notify("Nowhere to return to yet")
 		return
 	end
-	local c = character()
-	local hrp = c and c:FindFirstChild("HumanoidRootPart")
-	if not hrp then return end
-	local back = tpReturn
-	tpReturn = hrp.CFrame -- so it toggles back and forth
-	hrp.CFrame = back
-	hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-	notify("Returned")
+	local back = tpReturn -- teleportTo overwrites it with where we are now, so this toggles
+	teleportTo("Returned", function() return { pos = back.Position, exact = true } end)
 end)
 
 local tpEntries = {}
 do
+	tpRemember() -- warm the pad cache while we are still standing where we logged in
 	local zones = workspace:FindFirstChild("zones")
 	local folder = zones and zones:FindFirstChild("player")
-	local items = {}
+	-- One button per name. Fisch has ~390 zone boxes but only ~150 distinct places; the rest
+	-- are the same area chopped into several boxes, and they made the old list a wall of
+	-- duplicate names that each sent you somewhere different.
+	local order = {}
 	if folder then
 		for _, part in ipairs(folder:GetChildren()) do
-			if part:IsA("BasePart") then items[#items + 1] = part end
+			if part:IsA("BasePart") then
+				local list = tpZoneParts[part.Name]
+				if not list then
+					list = {}
+					tpZoneParts[part.Name] = list
+					order[#order + 1] = part.Name
+				end
+				list[#list + 1] = part
+			end
 		end
 	end
-	table.sort(items, function(a, b) return a.Name < b.Name end)
+	table.sort(order)
 
-	for i, part in ipairs(items) do
+	for i, name in ipairs(order) do
+		local parts = tpZoneParts[name]
 		local b = new("TextButton", {
-			Parent = teleportPage, LayoutOrder = 10 + i, Size = UDim2.new(1, -6, 0, 30),
+			Parent = teleportPage, LayoutOrder = 110 + i, Size = UDim2.new(1, -6, 0, 30),
 			BackgroundColor3 = T.panel, BackgroundTransparency = 0.28,
 			AutoButtonColor = false, Text = "",
 		}, { corner(8), stroke(T.stroke, 1, 0.55) })
 		new("TextLabel", {
 			Parent = b, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(10, 0),
-			BackgroundTransparency = 1, Text = part.Name,
+			BackgroundTransparency = 1, Text = name,
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextTruncate = Enum.TextTruncate.AtEnd,
 			Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.text,
 		})
 		b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.panel2 }) end)
 		b.MouseLeave:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.panel }) end)
+		-- spawned like button() does: a teleport yields, and not every caller of a click can
 		b.MouseButton1Click:Connect(function()
-			if not part.Parent then
-				notify("That zone no longer exists", T.danger)
-				return
-			end
-			-- lifted a little so you don't land inside the zone's floor
-			teleportTo(CFrame.new(part.Position + Vector3.new(0, 4, 0)), part.Name)
+			task.spawn(teleportTo, name, function() return tpTarget(name, parts) end)
 		end)
-		tpEntries[#tpEntries + 1] = { btn = b, name = string.lower(part.Name) }
+		tpEntries[#tpEntries + 1] = { btn = b, name = string.lower(name) }
 	end
 
-	tpSearch.PlaceholderText = string.format("search %d locations…", #items)
+	tpSearch.PlaceholderText = string.format("search %d locations…", #order)
 end
 
 tpSearch:GetPropertyChangedSignal("Text"):Connect(function()
@@ -4869,6 +5490,12 @@ if writefile and getcustomasset then
 			})
 		end
 	end
+	-- lets a hub run on its own, without this loader, still find everything written above
+	pcall(function()
+		writefile("shadeed_manifest.json", game:GetService("HttpService"):JSONEncode({
+			icons = SHADEEDWARE_ICONS, videos = SHADEEDWARE_VIDEOS,
+		}))
+	end)
 end
 
 local ok, err = xpcall(picked.run, debug.traceback)
