@@ -8991,6 +8991,9 @@ local State = {
 	shots = 0, -- real shots redirected (the bow's aim preview doesn't count)
 	outOfReach = 0, -- shots with a target the projectile couldn't reach in its lifetime
 	locks = 0,
+	resolved = 0, -- shots the server has ruled on
+	confirmed = 0, -- of those, hits the server counted
+	headshots = 0,
 	lastShot = nil,
 	lastError = nil,
 	relay = "connecting…", -- the controller's popup relay, for the Info tab
@@ -9009,6 +9012,12 @@ local AIM = {
 	lead = true, -- predict movement and jumps; off aims at where they stand now
 	skipPearls = true, -- a redirected telepearl would drag you onto the enemy
 	maxDistance = 1000,
+	-- "Adaptive" = per player, whichever of Straight / Damped / Pattern has been landing on them
+	model = "Adaptive",
+	autoTune = true, -- learn the server lead from the hits the server confirms
+
+	-- Extra seconds on top of the measured server lead (see SERVER_LEAD_BASE), for odd connections.
+	latency = 0,
 }
 
 local ESP = {
@@ -10050,14 +10059,28 @@ local GROUND_PROBE = 200
 -- A single ray down the middle slips past the block edge a player is standing on and finds ground
 -- far below; a cast the width of their feet doesn't.
 local FOOTPRINT = Vector3.new(1.6, 0.1, 1.6)
--- Lead fades out over this many seconds: short for strafing or a run that just began, long for a
--- steady run. Tuned on recorded movement: full lead overshot start-stop players by 9 studs at 0.8s.
+-- The damped model's lead fades out over this many seconds: short for strafing or a run that just
+-- began, long for a steady run.
 local LEAD_TAU_MIN, LEAD_TAU_MAX = 0.3, 4
-local TRACK_WINDOW = 0.5
 -- Past this much flight the head is too small to lead reliably, so Auto sends headhunter arrows
 -- at the body instead.
 local HEADSHOT_MAX_FLIGHT = 0.45
 local ARC_CHECKS = 8
+-- The server re-flies every shot and checks it against players rewound to launch - 45ms + flight,
+-- while we see them a network delay in the past. Measured: its check matched our view 0.1s ahead
+-- at 36ms ping, 25 of 25 shots on a sprinting target. Half the ping is the part that grows with it.
+local SERVER_LEAD_BASE = 0.082
+
+-- Movement memory each player's habits are learned from: 30 samples a second, 6 seconds deep.
+local HIST_HZ = 30
+local HIST_LEN = 6 * HIST_HZ
+local LAG1, LAG2 = 4, 9 -- 0.15s and 0.3s back: the shape of their last moves, for matching
+local STEADY_SPAN = 15 -- 0.5s, for the damped model's steadiness
+local PICK_WINDOW = 2 * HIST_HZ -- hindsight each player's model pick is scored over
+local KNN_K = 16
+local MODE_PRIOR = 3 -- how much straight lead counts among the pattern model's candidates
+local HIT_TOL = 2.5 -- horizontal slack of the server's check: 1 stud body + the 1.5 stud query box
+local PICK_CACHE = 0.25
 
 local FOV_IDLE = Color3.fromRGB(255, 255, 255)
 local FOV_LOCKED = Color3.fromRGB(80, 255, 120)
@@ -10077,33 +10100,308 @@ local arcParams = RaycastParams.new()
 arcParams.FilterType = Enum.RaycastFilterType.Exclude
 arcParams.IgnoreWater = true
 
--- recent root positions per player, oldest first, so the lead can tell a steady run from strafing
-local tracks = {}
+-- Ring buffers per player, indexed by an ever-growing sample count n.
+local hist = {}
 
-local function trackPlayers()
+local function slot(j) return (j - 1) % HIST_LEN + 1 end
+local function oldest(h) return math.max(1, h.n - HIST_LEN + 1) end
+
+local function recordPlayers()
 	local now = os.clock()
 	for _, player in ipairs(Players:GetPlayers()) do
 		if player == LocalPlayer then continue end
 		local char = player.Character
 		local root = char and char:FindFirstChild("HumanoidRootPart")
 		if not root then
-			tracks[player] = nil
+			hist[player] = nil
 			continue
 		end
-		local tr = tracks[player]
-		if not tr or tr.root ~= root then
-			tr = { root = root }
-			tracks[player] = tr
+		local h = hist[player]
+		if not h or h.root ~= root then
+			h = { root = root, n = 0, last = -1, run = 0, t = {}, px = {}, py = {}, pz = {}, vx = {}, vz = {}, turn = {} }
+			hist[player] = h
 		end
-		local last = tr[#tr]
-		if not last or now - last[1] >= 1 / 60 then
-			tr[#tr + 1] = { now, root.Position }
-			while #tr > 2 and now - tr[2][1] >= TRACK_WINDOW do table.remove(tr, 1) end
+		if now - h.last >= 1 / HIST_HZ - 0.002 then
+			h.last = now
+			local p, v = root.Position, root.AssemblyLinearVelocity
+			h.n += 1
+			local s = slot(h.n)
+			h.t[s], h.px[s], h.py[s], h.pz[s], h.vx[s], h.vz[s] = now, p.X, p.Y, p.Z, v.X, v.Z
+			-- seconds since their heading last swung past 60 degrees, or they stopped
+			local speed = math.sqrt(v.X * v.X + v.Z * v.Z)
+			if speed < 3 then
+				h.refx, h.run = nil, 0
+			elseif not h.refx or (v.X * h.refx + v.Z * h.refz) / (speed * math.sqrt(h.refx * h.refx + h.refz * h.refz)) < 0.5 then
+				h.refx, h.refz, h.run = v.X, v.Z, 0
+			else
+				h.run += 1
+			end
+			h.turn[s] = math.min(h.run / HIST_HZ, 2)
 		end
 	end
-	for player in pairs(tracks) do
-		if player.Parent ~= Players then tracks[player] = nil end
+	for player in pairs(hist) do
+		if player.Parent ~= Players then hist[player] = nil end
 	end
+end
+
+-- Damped model at sample j: the lead fades with a time constant set by how steadily they've run.
+local function dampedTau(h, j)
+	local s = slot(j)
+	local vx, vz = h.vx[s], h.vz[s]
+	local speed = math.sqrt(vx * vx + vz * vz)
+	local steady = 0
+	if speed >= 1 and j - STEADY_SPAN >= oldest(h) then
+		local s0 = slot(j - STEADY_SPAN)
+		local dx, dz = h.px[s] - h.px[s0], h.pz[s] - h.pz[s0]
+		steady = math.clamp(math.sqrt(dx * dx + dz * dz) / (speed * STEADY_SPAN / HIST_HZ), 0, 1)
+	end
+	return LEAD_TAU_MIN + (LEAD_TAU_MAX - LEAD_TAU_MIN) * steady * steady
+end
+
+-- Pattern model at sample m: find the moments in their history that looked most like m (same
+-- velocity, same last few moves, same time since their last turn, same spot), see where each of
+-- those went H seconds later, and return the displacement most of them agree on. Averaging them
+-- instead lands between "kept running" and "turned back", where nobody ever is.
+local function patternAt(h, m, H)
+	local hs = math.floor(H * HIST_HZ + 0.5)
+	local sm, s1, s2 = slot(m), slot(m - LAG1), slot(m - LAG2)
+	local vxn, vzn = h.vx[sm], h.vz[sm]
+	local linx, linz = vxn * H, vzn * H
+	local lo, hi = oldest(h) + LAG2, m - hs
+	if hi - lo < 10 then return linx, linz end
+
+	local px, pz, vx, vz, turn = h.px, h.pz, h.vx, h.vz, h.turn
+	local cand = table.create(hi - lo + 1)
+	for j = lo, hi do
+		local sj, a1, a2 = slot(j), slot(j - LAG1), slot(j - LAG2)
+		local d = (math.sqrt((vx[sj] - vxn) ^ 2 + (vz[sj] - vzn) ^ 2)
+			+ math.sqrt((vx[a1] - vx[s1]) ^ 2 + (vz[a1] - vz[s1]) ^ 2)
+			+ math.sqrt((vx[a2] - vx[s2]) ^ 2 + (vz[a2] - vz[s2]) ^ 2)) / 20
+			+ math.abs(turn[sj] - turn[sm])
+			+ 0.15 * math.sqrt((px[sj] - px[sm]) ^ 2 + (pz[sj] - pz[sm]) ^ 2)
+		cand[#cand + 1] = { d, j }
+	end
+	table.sort(cand, function(a, b) return a[1] < b[1] end)
+
+	local k = math.min(KNN_K, #cand)
+	local dx, dz, w = table.create(k + 1), table.create(k + 1), table.create(k + 1)
+	local wsum = 0
+	for i = 1, k do
+		local sj, sf = slot(cand[i][2]), slot(cand[i][2] + hs)
+		dx[i], dz[i] = px[sf] - px[sj], pz[sf] - pz[sj]
+		w[i] = 1 / (cand[i][1] + 0.05)
+		wsum += w[i]
+	end
+	dx[k + 1], dz[k + 1], w[k + 1] = linx, linz, MODE_PRIOR * wsum / k
+
+	local tol2 = HIT_TOL * HIT_TOL
+	local best, bestScore = k + 1, -1
+	for a = 1, k + 1 do
+		local score = 0
+		for b = 1, k + 1 do
+			if (dx[a] - dx[b]) ^ 2 + (dz[a] - dz[b]) ^ 2 <= tol2 then score += w[b] end
+		end
+		if score > bestScore then best, bestScore = a, score end
+	end
+	local sx, sz, sw = 0, 0, 0
+	for b = 1, k + 1 do
+		if (dx[best] - dx[b]) ^ 2 + (dz[best] - dz[b]) ^ 2 <= tol2 then
+			sx += dx[b] * w[b]
+			sz += dz[b] * w[b]
+			sw += w[b]
+		end
+	end
+	return sx / sw, sz / sw
+end
+
+-- Per player: which model has actually been landing on them. Each one is replayed over the last
+-- 2 seconds of their history at this flight time, scored on how often it came within the hit
+-- tolerance, and the best one is used. Ties go to straight lead.
+local pickCache = {}
+
+-- the model that would have landed most often on the 2 seconds of history before sample m
+local function scoreModels(h, m, H)
+	local hs = math.floor(H * HIST_HZ + 0.5)
+	local first = math.max(oldest(h) + LAG2 + STEADY_SPAN, m - hs - PICK_WINDOW)
+	local tol2 = HIT_TOL * HIT_TOL
+	local sLin, sDamp, sPat = 0, 0, 0
+	for j = first, m - hs, 2 do
+		local sj, sf = slot(j), slot(j + hs)
+		local ax, az = h.px[sf] - h.px[sj], h.pz[sf] - h.pz[sj]
+		local vx, vz = h.vx[sj], h.vz[sj]
+		if (vx * H - ax) ^ 2 + (vz * H - az) ^ 2 <= tol2 then sLin += 1 end
+		local tau = dampedTau(h, j)
+		local f = tau * (1 - math.exp(-H / tau))
+		if (vx * f - ax) ^ 2 + (vz * f - az) ^ 2 <= tol2 then sDamp += 1 end
+		local mx, mz = patternAt(h, j, H)
+		if (mx - ax) ^ 2 + (mz - az) ^ 2 <= tol2 then sPat += 1 end
+	end
+	local model = "Straight"
+	if sDamp > sLin then model = "Damped" end
+	if sPat > math.max(sLin, sDamp) then model = "Pattern" end
+	return model
+end
+
+local function pickModel(player, h, H)
+	if AIM.model ~= "Adaptive" then return AIM.model end
+	local bucket = math.floor(H * 20 + 0.5)
+	local now = os.clock()
+	local c = pickCache[player]
+	if c and c.bucket == bucket and (c.n == h.n or now - c.at < PICK_CACHE) then
+		return c.model
+	end
+	local model = scoreModels(h, h.n, H)
+	pickCache[player] = { at = now, bucket = bucket, n = h.n, model = model }
+	return model
+end
+
+-- Server lead and auto-tune share one table so the script stays under Luau's 200-local limit.
+local Tune = { shots = 0, offset = 0, ping = 0.036 }
+do
+	local pingRead = false
+
+	-- Ping, re-read every quarter second and smoothed so one spike doesn't swing the lead.
+	function Tune.readPing()
+		local ok, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+		if ok and type(ping) == "number" and ping > 0 and ping < 2 then
+			Tune.ping = pingRead and Tune.ping + (ping - Tune.ping) * 0.3 or ping
+			pingRead = true
+		end
+		return Tune.ping
+	end
+
+	-- the lead the ping alone predicts; auto-tune learns an offset on top of it
+	local function baseLead(ping)
+		return SERVER_LEAD_BASE + ping / 2
+	end
+
+	-- Auto-tune. Every hit the server confirms, and every shot it doesn't, votes for the lead
+	-- offsets that would have predicted that verdict, replayed against where the arrow and the
+	-- player really went. Offsets are kept relative to baseLead at each shot's own ping, so a ping
+	-- change mid-match moves the lead straight away and the learned part carries over.
+	local TUNE_MIN, TUNE_MAX, TUNE_STEP = -0.15, 0.30, 0.005
+	local TUNE_BINS = math.floor((TUNE_MAX - TUNE_MIN) / TUNE_STEP + 0.5) + 1
+	local TUNE_DECAY = 0.97 -- older shots fade: a changed connection is relearned in ~30 shots
+	local scores = table.create(TUNE_BINS, 0)
+	local pending = {}
+	Tune.scores, Tune.pending = scores, pending
+
+	function Tune.serverLead()
+		local learned = AIM.autoTune and Tune.shots >= 3 and Tune.offset or 0
+		return baseLead(Tune.ping) + learned + AIM.latency
+	end
+
+	-- a real shot, queued for the server's verdict
+	function Tune.queue(shot)
+		if #pending >= 40 then return end
+		shot.ping = Tune.ping
+		shot.due = shot.at + shot.flight + math.max(0.6, 2 * Tune.ping + 0.45, baseLead(Tune.ping) + TUNE_MAX + 0.05)
+		pending[#pending + 1] = shot
+	end
+
+	-- Whether a shot would have hit had the server checked the player `delta` seconds past our view:
+	-- the arrow's real path against where we rendered them, nil when their path ran out.
+	function Tune.wouldHit(shot, delta)
+		local h, o, v, g = shot.h, shot.origin, shot.velocity, shot.gravity
+		local tol2 = HIT_TOL * HIT_TOL
+		local t0 = shot.at + delta
+		local lo, last = oldest(h), h.n
+		if last <= lo or t0 < h.t[slot(lo)] then return nil end
+		-- the sample at or before the first check, found once; after that it walks with the arrow
+		local hi = last
+		while hi - lo > 1 do
+			local mid = (lo + hi) // 2
+			if h.t[slot(mid)] <= t0 then lo = mid else hi = mid end
+		end
+		local j = lo
+		-- under a stud of travel per step, so a fast arrow can't skip over the body
+		for tau = 0, shot.flight + 0.02, math.min(0.01, 0.8 / math.max(v.Magnitude, 1)) do
+			local t = t0 + tau
+			while j < last and h.t[slot(j + 1)] <= t do j += 1 end
+			if j >= last then return nil end
+			local a, b = slot(j), slot(j + 1)
+			local span = h.t[b] - h.t[a]
+			local u = span > 0 and (t - h.t[a]) / span or 0
+			local dy = o.Y + v.Y * tau - 0.5 * g * tau * tau - (h.py[a] + (h.py[b] - h.py[a]) * u)
+			if dy >= -3.5 and dy <= 2.5 then
+				local dx = o.X + v.X * tau - (h.px[a] + (h.px[b] - h.px[a]) * u)
+				local dz = o.Z + v.Z * tau - (h.pz[a] + (h.pz[b] - h.pz[a]) * u)
+				if dx * dx + dz * dz <= tol2 then return true end
+			end
+		end
+		return false
+	end
+
+	function Tune.learn(shot)
+		local base = baseLead(shot.ping)
+		local votes = table.create(TUNE_BINS, 0)
+		local informative, first = false, nil
+		for i = 1, TUNE_BINS do
+			local verdict = Tune.wouldHit(shot, base + TUNE_MIN + (i - 1) * TUNE_STEP)
+			if verdict == nil then return end -- their path ran out: died, respawned, left
+			votes[i] = verdict == shot.hit and 1 or 0
+			if first == nil then
+				first = votes[i]
+			elseif votes[i] ~= first then
+				informative = true
+			end
+		end
+		-- a shot every offset agrees on (a standing target, a miss by miles) says nothing about the lead
+		if not informative then return end
+		Tune.shots += 1
+		for i = 1, TUNE_BINS do
+			scores[i] = scores[i] * TUNE_DECAY + votes[i]
+		end
+		-- The best offset after a light smoothing, ties going to the one nearest the ping formula.
+		-- Replayed on recorded shots with the formula made wrong by up to 100ms, this landed on the
+		-- measured lead every time; taking the middle of the tied run drifted between runs instead.
+		local bestOffset, best = 0, -1
+		for i = 1, TUNE_BINS do
+			local sm = (scores[math.max(i - 1, 1)] + scores[i] + scores[math.min(i + 1, TUNE_BINS)]) / 3
+			local offset = TUNE_MIN + (i - 1) * TUNE_STEP
+			if sm > best + 1e-9 or (math.abs(sm - best) <= 1e-9 and math.abs(offset) < math.abs(bestOffset)) then
+				bestOffset, best = offset, sm
+			end
+		end
+		Tune.offset = bestOffset
+	end
+
+	function Tune.resolve()
+		local now = os.clock()
+		local i = 1
+		while i <= #pending do
+			local shot = pending[i]
+			if now >= shot.due then
+				table.remove(pending, i)
+				State.resolved += 1
+				if shot.hit then State.confirmed += 1 end
+				if shot.headshot then State.headshots += 1 end
+				local ok, err = pcall(Tune.learn, shot)
+				if not ok then State.lastError = tostring(err) end
+			else
+				i += 1
+			end
+		end
+	end
+
+	-- The server's own damage feed: our projectile landing on a player, with its headshot flag.
+	pcall(function()
+		local net = require(LocalPlayer.PlayerScripts.TS.lib.network)
+		local DamageType = require(ReplicatedStorage.TS.damage["damage-type"]).DamageType
+		Tune.disconnect = net.EntityDamageEventZap.On(function(entity, _, damageType, _, attacker, _, _, extra)
+			if attacker ~= LocalPlayer.Character or damageType ~= DamageType.PROJECTILE then return end
+			local now = os.clock()
+			for _, shot in ipairs(pending) do
+				if not shot.hit and shot.char == entity and now >= shot.at then
+					shot.hit = true
+					shot.headshot = type(extra) == "table" and extra.headshot == true
+					break
+				end
+			end
+		end)
+	end)
+
+	Tune.readPing()
 end
 
 local lockHeld = false -- Hold: the lock key is down. Toggle: the lock is armed
@@ -10192,32 +10490,37 @@ local function currentTarget(wantHead)
 	return player, part, root, hum
 end
 
--- How much of their current speed they've held, in a straight line, over the last half second:
--- 1 for a steady run, near 0 for strafing back and forth, stopping, or a run that only just began.
-local function steadiness(player, speed)
-	local tr = tracks[player]
-	if not tr or #tr < 2 or speed < 1 then return 0 end
-	local a, b = tr[1], tr[#tr]
-	local span = b[1] - a[1]
-	if span < 0.1 then return 0 end
-	local moved = Vector3.new(b[2].X - a[2].X, 0, b[2].Z - a[2].Z).Magnitude
-	return math.clamp(moved / (speed * span), 0, 1)
-end
-
--- Where `part` will be `t` seconds from now. Across the ground: their run velocity, carried in full
--- for a steady run and fading out for strafing. Up and down: level unless they're rising or
--- falling, then a jump arc under workspace gravity that lands on the ground under their feet.
-local function predictor(player, part, root, hum)
+-- Where `part` will be `t` seconds after launch, as the server will check it: `ahead` seconds past
+-- what we can see. Across the ground: the model picked for this player at total horizon H (straight
+-- lead when H is nil). Up and down: level unless they're rising or falling, then a jump arc under
+-- workspace gravity that lands on the ground under their feet.
+local function predictor(player, part, root, hum, ahead, H)
 	local start = part.Position
 	if not AIM.lead then
-		return function() return start end
+		return function() return start end, "Off"
 	end
 	local vel = root.AssemblyLinearVelocity
-	local flat = Vector3.new(vel.X, 0, vel.Z)
-	local s = steadiness(player, flat.Magnitude)
-	local tau = LEAD_TAU_MIN + (LEAD_TAU_MAX - LEAD_TAU_MIN) * s * s
-	local gravity = workspace.Gravity
+	local model, lead = "Straight", nil
+	local h = hist[player]
+	if H and h and h.n > LAG2 then
+		model = pickModel(player, h, H)
+		if model == "Pattern" then
+			local mx, mz = patternAt(h, h.n, H)
+			lead = function(t)
+				local f = t / H
+				return mx * f, mz * f
+			end
+		elseif model == "Damped" then
+			local tau = dampedTau(h, h.n)
+			lead = function(t)
+				local f = tau * (1 - math.exp(-t / tau))
+				return vel.X * f, vel.Z * f
+			end
+		end
+	end
+	lead = lead or function(t) return vel.X * t, vel.Z * t end
 
+	local gravity = workspace.Gravity
 	local airborne = math.abs(vel.Y) > 2
 	local lowest = -math.huge
 	if airborne then
@@ -10230,10 +10533,14 @@ local function predictor(player, part, root, hum)
 	end
 
 	return function(t)
-		local p = start + flat * (tau * (1 - math.exp(-t / tau)))
-		if not airborne then return p end
-		return Vector3.new(p.X, math.max(start.Y + vel.Y * t - 0.5 * gravity * t * t, lowest), p.Z)
-	end
+		t += ahead
+		local dx, dz = lead(t)
+		local y = start.Y
+		if airborne then
+			y = math.max(start.Y + vel.Y * t - 0.5 * gravity * t * t, lowest)
+		end
+		return Vector3.new(start.X + dx, y, start.Z + dz)
+	end, model
 end
 
 -- whether the arc reaches the aim point without clipping a block on the way
@@ -10307,19 +10614,33 @@ local function redirect(handler, launch, isPreview)
 		candidates[2] = head
 	end
 
+	local ahead = Tune.serverLead()
 	local shots = {}
 	for _, aimPart in ipairs(candidates) do
-		local predict = predictor(player, aimPart, root, hum)
-		-- Solve from positionFrom, move the origin to where that direction really spawns the model, solve again.
+		-- Solve from positionFrom, move the origin to where that direction really spawns the model,
+		-- solve again, all with straight lead. That flight time picks this player's model; when it
+		-- isn't straight lead, solve once more with it.
+		local predict = predictor(player, aimPart, root, hum, ahead, nil)
 		local dir, flight, spawn = (aimPart.Position - from).Unit, nil, nil
 		for _ = 1, 2 do
 			spawn = (CFrame.lookAt(from, from + dir) * SPAWN_OFFSET).Position
 			dir, flight = solveIntercept(spawn, speed, gravity, predict, lifetime)
 			if not dir then break end
 		end
+		local model = AIM.lead and "Straight" or "Off"
+		if dir and AIM.lead then
+			local predict2, picked = predictor(player, aimPart, root, hum, ahead, flight + ahead)
+			if picked ~= "Straight" then
+				local spawn2 = (CFrame.lookAt(from, from + dir) * SPAWN_OFFSET).Position
+				local dir2, flight2 = solveIntercept(spawn2, speed, gravity, predict2, lifetime)
+				if dir2 then
+					dir, flight, spawn, model = dir2, flight2, spawn2, picked
+				end
+			end
+		end
 		if dir then
 			shots[#shots + 1] = {
-				dir = dir, flight = flight, spawn = spawn, part = aimPart,
+				dir = dir, flight = flight, spawn = spawn, part = aimPart, model = model,
 				clear = arcIsClear(spawn, dir * speed, gravity, flight, char),
 				farHead = aimPart == head and AIM.part == "Auto" and flight > HEADSHOT_MAX_FLIGHT,
 			}
@@ -10348,10 +10669,20 @@ local function redirect(handler, launch, isPreview)
 		State.shots += 1
 		State.lastShot = string.format("%s %d sps → %s · %.2fs%s", projectile, math.floor(speed + 0.5),
 			player.DisplayName, pick.flight, pick.part == head and " · head" or "")
+		State.lastModel = string.format("%s · server lead %dms", pick.model, math.floor(ahead * 1000 + 0.5))
 		State.lastLaunch = {
 			at = os.clock(), origin = pick.spawn, velocity = launch.initialVelocity, gravity = gravity,
 			flight = pick.flight, target = player, part = pick.part.Name, clear = pick.clear,
+			model = pick.model, ahead = ahead,
 		}
+		-- queued for the server's verdict, which auto-tune learns the lead from
+		local h = hist[player]
+		if h then
+			Tune.queue({
+				at = os.clock(), origin = pick.spawn, velocity = launch.initialVelocity, gravity = gravity,
+				flight = pick.flight, char = char, h = h,
+			})
+		end
 	end
 end
 
@@ -10392,274 +10723,277 @@ end
 -- right after the default camera script, so the circle and marker line up with this frame's view
 local AIM_BIND = randomName()
 RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, aimStep)
-conns[#conns + 1] = RunService.Heartbeat:Connect(trackPlayers)
+conns[#conns + 1] = RunService.Heartbeat:Connect(recordPlayers)
 
 ----------------------------------------------------------------------
 -- ESP
 ----------------------------------------------------------------------
-local BLACK = Color3.new(0, 0, 0)
-local WHITE = Color3.new(1, 1, 1)
-local HP_LOW = Color3.fromRGB(255, 60, 60)
-local HP_FULL = Color3.fromRGB(60, 255, 90)
-local FONT = Drawing and Drawing.Fonts and Drawing.Fonts.Plex or 2
+-- Only these three are used outside (unload, debug handle); the rest lives in the block to
+-- keep the script under Luau's 200-local limit.
+local espEntries, removePlayer, ESP_BIND = {}, nil, randomName()
+do
+	local BLACK = Color3.new(0, 0, 0)
+	local WHITE = Color3.new(1, 1, 1)
+	local HP_LOW = Color3.fromRGB(255, 60, 60)
+	local HP_FULL = Color3.fromRGB(60, 255, 90)
+	local FONT = Drawing and Drawing.Fonts and Drawing.Fonts.Plex or 2
 
-local losParams = RaycastParams.new()
-losParams.FilterType = Enum.RaycastFilterType.Exclude
-losParams.IgnoreWater = true
+	local losParams = RaycastParams.new()
+	losParams.FilterType = Enum.RaycastFilterType.Exclude
+	losParams.IgnoreWater = true
 
-local function hasLineOfSight(camPos, part, char)
-	local hit = workspace:Raycast(camPos, part.Position - camPos, losParams)
-	return not hit or hit.Instance:IsDescendantOf(char)
-end
+	local function hasLineOfSight(camPos, part, char)
+		local hit = workspace:Raycast(camPos, part.Position - camPos, losParams)
+		return not hit or hit.Instance:IsDescendantOf(char)
+	end
 
--- every BedWars character is R15
-local R15_BONES = {
-	{ "Head", "UpperTorso" },
-	{ "UpperTorso", "LowerTorso" },
-	{ "UpperTorso", "LeftUpperArm" },
-	{ "LeftUpperArm", "LeftLowerArm" },
-	{ "LeftLowerArm", "LeftHand" },
-	{ "UpperTorso", "RightUpperArm" },
-	{ "RightUpperArm", "RightLowerArm" },
-	{ "RightLowerArm", "RightHand" },
-	{ "LowerTorso", "LeftUpperLeg" },
-	{ "LeftUpperLeg", "LeftLowerLeg" },
-	{ "LeftLowerLeg", "LeftFoot" },
-	{ "LowerTorso", "RightUpperLeg" },
-	{ "RightUpperLeg", "RightLowerLeg" },
-	{ "RightLowerLeg", "RightFoot" },
-}
-local MAX_BONES = #R15_BONES
-local FLAT = { "boxOutline", "box", "name", "dist", "item", "hpOutline", "hp", "tracer" }
-
-local espEntries = {}
-
-local function newEntry()
-	local e = {
-		boxOutline = newDrawing("Square", { Filled = false, Color = BLACK, ZIndex = 1 }),
-		box = newDrawing("Square", { Filled = false, ZIndex = 2 }),
-		name = newDrawing("Text", { Center = true, Outline = true, OutlineColor = BLACK, Color = WHITE, Font = FONT, ZIndex = 3 }),
-		dist = newDrawing("Text", {
-			Center = true, Outline = true, OutlineColor = BLACK,
-			Color = Color3.fromRGB(205, 205, 205), Font = FONT, ZIndex = 3,
-		}),
-		item = newDrawing("Text", {
-			Center = true, Outline = true, OutlineColor = BLACK,
-			Color = Color3.fromRGB(255, 214, 110), Font = FONT, ZIndex = 3,
-		}),
-		hpOutline = newDrawing("Square", { Filled = true, Color = BLACK, ZIndex = 1 }),
-		hp = newDrawing("Square", { Filled = true, ZIndex = 2 }),
-		tracer = newDrawing("Line", { ZIndex = 1 }),
-		bones = table.create(MAX_BONES),
-		hl = Instance.new("Highlight"),
+	-- every BedWars character is R15
+	local R15_BONES = {
+		{ "Head", "UpperTorso" },
+		{ "UpperTorso", "LowerTorso" },
+		{ "UpperTorso", "LeftUpperArm" },
+		{ "LeftUpperArm", "LeftLowerArm" },
+		{ "LeftLowerArm", "LeftHand" },
+		{ "UpperTorso", "RightUpperArm" },
+		{ "RightUpperArm", "RightLowerArm" },
+		{ "RightLowerArm", "RightHand" },
+		{ "LowerTorso", "LeftUpperLeg" },
+		{ "LeftUpperLeg", "LeftLowerLeg" },
+		{ "LeftLowerLeg", "LeftFoot" },
+		{ "LowerTorso", "RightUpperLeg" },
+		{ "RightUpperLeg", "RightLowerLeg" },
+		{ "RightLowerLeg", "RightFoot" },
 	}
-	for i = 1, MAX_BONES do
-		e.bones[i] = newDrawing("Line", { ZIndex = 2 })
-	end
-	e.hl.Name = randomName()
-	e.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	e.hl.OutlineTransparency = 0
-	e.hl.Enabled = false
-	e.hl.Parent = espFolder
-	return e
-end
+	local MAX_BONES = #R15_BONES
+	local FLAT = { "boxOutline", "box", "name", "dist", "item", "hpOutline", "hp", "tracer" }
 
-local function hide2D(e)
-	for _, key in ipairs(FLAT) do
-		e[key].Visible = false
-	end
-	for _, line in ipairs(e.bones) do
-		line.Visible = false
-	end
-end
 
-local function hideEntry(e)
-	hide2D(e)
-	e.hl.Enabled = false
-end
-
-local function destroyEntry(e)
-	for _, key in ipairs(FLAT) do
-		pcall(function() e[key]:Remove() end)
-	end
-	for _, line in ipairs(e.bones) do
-		pcall(function() line:Remove() end)
-	end
-	e.hl:Destroy()
-end
-
--- false = don't draw this player at all (dead, teammate, too far)
-local function renderEntry(player, e, cam, camPos, origin, tracerFrom)
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not (hum and hrp) or hum.Health <= 0 then return false end
-	if ESP.teamCheck and isTeammate(player) then return false end
-	local dist = (hrp.Position - origin).Magnitude
-	if dist > ESP.maxDistance then return false end
-
-	local head = char:FindFirstChild("Head")
-	local color = ESP.color
-	if ESP.colorMode == "Team" and player.Team then
-		color = player.Team.TeamColor.Color
-	elseif hasLineOfSight(camPos, head or hrp, char) then
-		color = ESP.visibleColor
-	end
-
-	-- chams are 3D, so they stay on even when the box would land off screen
-	local hl = e.hl
-	if ESP.chams then
-		if hl.Adornee ~= char then hl.Adornee = char end
-		if hl.FillColor ~= color then
-			hl.FillColor = color
-			hl.OutlineColor = color
+	local function newEntry()
+		local e = {
+			boxOutline = newDrawing("Square", { Filled = false, Color = BLACK, ZIndex = 1 }),
+			box = newDrawing("Square", { Filled = false, ZIndex = 2 }),
+			name = newDrawing("Text", { Center = true, Outline = true, OutlineColor = BLACK, Color = WHITE, Font = FONT, ZIndex = 3 }),
+			dist = newDrawing("Text", {
+				Center = true, Outline = true, OutlineColor = BLACK,
+				Color = Color3.fromRGB(205, 205, 205), Font = FONT, ZIndex = 3,
+			}),
+			item = newDrawing("Text", {
+				Center = true, Outline = true, OutlineColor = BLACK,
+				Color = Color3.fromRGB(255, 214, 110), Font = FONT, ZIndex = 3,
+			}),
+			hpOutline = newDrawing("Square", { Filled = true, Color = BLACK, ZIndex = 1 }),
+			hp = newDrawing("Square", { Filled = true, ZIndex = 2 }),
+			tracer = newDrawing("Line", { ZIndex = 1 }),
+			bones = table.create(MAX_BONES),
+			hl = Instance.new("Highlight"),
+		}
+		for i = 1, MAX_BONES do
+			e.bones[i] = newDrawing("Line", { ZIndex = 2 })
 		end
-		if hl.FillTransparency ~= ESP.chamsFill then hl.FillTransparency = ESP.chamsFill end
-		hl.Enabled = true
-	else
-		hl.Enabled = false
+		e.hl.Name = randomName()
+		e.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		e.hl.OutlineTransparency = 0
+		e.hl.Enabled = false
+		e.hl.Parent = espFolder
+		return e
 	end
 
-	-- box runs from the top of the head to the floor; R15 HipHeight is the gap under the HRP
-	local topWorld = head and head.Position + Vector3.new(0, head.Size.Y / 2 + 0.25, 0)
-		or hrp.Position + Vector3.new(0, 3, 0)
-	local bottomWorld = hrp.Position - Vector3.new(0, hrp.Size.Y / 2 + hum.HipHeight, 0)
-	local top = cam:WorldToViewportPoint(topWorld)
-	local bottom = cam:WorldToViewportPoint(bottomWorld)
-	if top.Z <= 0 or bottom.Z <= 0 then
+	local function hide2D(e)
+		for _, key in ipairs(FLAT) do
+			e[key].Visible = false
+		end
+		for _, line in ipairs(e.bones) do
+			line.Visible = false
+		end
+	end
+
+	local function hideEntry(e)
 		hide2D(e)
-		return true
+		e.hl.Enabled = false
 	end
 
-	local h = math.max(bottom.Y - top.Y, 6)
-	local w = h * 0.55
-	local cx = (top.X + bottom.X) / 2
-	local x, y = math.floor(cx - w / 2), math.floor(top.Y)
-	w, h = math.floor(w), math.floor(h)
-	local thick = ESP.thickness
-
-	e.box.Visible, e.boxOutline.Visible = ESP.boxes, ESP.boxes
-	if ESP.boxes then
-		local pos, size = Vector2.new(x, y), Vector2.new(w, h)
-		e.box.Position, e.box.Size, e.box.Color, e.box.Thickness = pos, size, color, thick
-		e.boxOutline.Position, e.boxOutline.Size, e.boxOutline.Thickness = pos, size, thick + 2
+	local function destroyEntry(e)
+		for _, key in ipairs(FLAT) do
+			pcall(function() e[key]:Remove() end)
+		end
+		for _, line in ipairs(e.bones) do
+			pcall(function() line:Remove() end)
+		end
+		e.hl:Destroy()
 	end
 
-	e.name.Visible = ESP.names
-	if ESP.names then
-		e.name.Text = player.DisplayName
-		e.name.Size = ESP.textSize
-		e.name.Position = Vector2.new(cx, y - ESP.textSize - 2)
-	end
+	-- false = don't draw this player at all (dead, teammate, too far)
+	local function renderEntry(player, e, cam, camPos, origin, tracerFrom)
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not (hum and hrp) or hum.Health <= 0 then return false end
+		if ESP.teamCheck and isTeammate(player) then return false end
+		local dist = (hrp.Position - origin).Magnitude
+		if dist > ESP.maxDistance then return false end
 
-	local below = y + h + 2
-	e.dist.Visible = ESP.distance
-	if ESP.distance then
-		e.dist.Text = math.floor(dist) .. " studs"
-		e.dist.Size = ESP.textSize - 1
-		e.dist.Position = Vector2.new(cx, below)
-		below += ESP.textSize
-	end
+		local head = char:FindFirstChild("Head")
+		local color = ESP.color
+		if ESP.colorMode == "Team" and player.Team then
+			color = player.Team.TeamColor.Color
+		elseif hasLineOfSight(camPos, head or hrp, char) then
+			color = ESP.visibleColor
+		end
 
-	local held = ESP.heldItem and char:FindFirstChild("HandInvItem")
-	held = held and held.Value
-	e.item.Visible = held ~= nil
-	if held then
-		e.item.Text = (held.Name:gsub("_", " "))
-		e.item.Size = ESP.textSize - 1
-		e.item.Position = Vector2.new(cx, below)
-	end
+		-- chams are 3D, so they stay on even when the box would land off screen
+		local hl = e.hl
+		if ESP.chams then
+			if hl.Adornee ~= char then hl.Adornee = char end
+			if hl.FillColor ~= color then
+				hl.FillColor = color
+				hl.OutlineColor = color
+			end
+			if hl.FillTransparency ~= ESP.chamsFill then hl.FillTransparency = ESP.chamsFill end
+			hl.Enabled = true
+		else
+			hl.Enabled = false
+		end
 
-	e.hp.Visible, e.hpOutline.Visible = ESP.healthBars, ESP.healthBars
-	if ESP.healthBars then
-		local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-		local hpFill = math.floor(h * frac)
-		e.hpOutline.Position, e.hpOutline.Size = Vector2.new(x - 6, y - 1), Vector2.new(4, h + 2)
-		e.hp.Position, e.hp.Size = Vector2.new(x - 5, y + h - hpFill), Vector2.new(2, hpFill)
-		e.hp.Color = HP_LOW:Lerp(HP_FULL, frac)
-	end
+		-- box runs from the top of the head to the floor; R15 HipHeight is the gap under the HRP
+		local topWorld = head and head.Position + Vector3.new(0, head.Size.Y / 2 + 0.25, 0)
+			or hrp.Position + Vector3.new(0, 3, 0)
+		local bottomWorld = hrp.Position - Vector3.new(0, hrp.Size.Y / 2 + hum.HipHeight, 0)
+		local top = cam:WorldToViewportPoint(topWorld)
+		local bottom = cam:WorldToViewportPoint(bottomWorld)
+		if top.Z <= 0 or bottom.Z <= 0 then
+			hide2D(e)
+			return true
+		end
 
-	e.tracer.Visible = ESP.tracers
-	if ESP.tracers then
-		e.tracer.From, e.tracer.To = tracerFrom, Vector2.new(cx, y + h)
-		e.tracer.Color, e.tracer.Thickness = color, thick
-	end
+		local h = math.max(bottom.Y - top.Y, 6)
+		local w = h * 0.55
+		local cx = (top.X + bottom.X) / 2
+		local x, y = math.floor(cx - w / 2), math.floor(top.Y)
+		w, h = math.floor(w), math.floor(h)
+		local thick = ESP.thickness
 
-	local used = 0
-	if ESP.skeleton then
-		for _, pair in ipairs(R15_BONES) do
-			local pa, pb = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
-			if pa and pb then
-				local a = cam:WorldToViewportPoint(pa.Position)
-				local b = cam:WorldToViewportPoint(pb.Position)
-				if a.Z > 0 and b.Z > 0 then
-					used += 1
-					local line = e.bones[used]
-					line.From, line.To = Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y)
-					line.Color, line.Thickness = color, thick
-					line.Visible = true
+		e.box.Visible, e.boxOutline.Visible = ESP.boxes, ESP.boxes
+		if ESP.boxes then
+			local pos, size = Vector2.new(x, y), Vector2.new(w, h)
+			e.box.Position, e.box.Size, e.box.Color, e.box.Thickness = pos, size, color, thick
+			e.boxOutline.Position, e.boxOutline.Size, e.boxOutline.Thickness = pos, size, thick + 2
+		end
+
+		e.name.Visible = ESP.names
+		if ESP.names then
+			e.name.Text = player.DisplayName
+			e.name.Size = ESP.textSize
+			e.name.Position = Vector2.new(cx, y - ESP.textSize - 2)
+		end
+
+		local below = y + h + 2
+		e.dist.Visible = ESP.distance
+		if ESP.distance then
+			e.dist.Text = math.floor(dist) .. " studs"
+			e.dist.Size = ESP.textSize - 1
+			e.dist.Position = Vector2.new(cx, below)
+			below += ESP.textSize
+		end
+
+		local held = ESP.heldItem and char:FindFirstChild("HandInvItem")
+		held = held and held.Value
+		e.item.Visible = held ~= nil
+		if held then
+			e.item.Text = (held.Name:gsub("_", " "))
+			e.item.Size = ESP.textSize - 1
+			e.item.Position = Vector2.new(cx, below)
+		end
+
+		e.hp.Visible, e.hpOutline.Visible = ESP.healthBars, ESP.healthBars
+		if ESP.healthBars then
+			local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+			local hpFill = math.floor(h * frac)
+			e.hpOutline.Position, e.hpOutline.Size = Vector2.new(x - 6, y - 1), Vector2.new(4, h + 2)
+			e.hp.Position, e.hp.Size = Vector2.new(x - 5, y + h - hpFill), Vector2.new(2, hpFill)
+			e.hp.Color = HP_LOW:Lerp(HP_FULL, frac)
+		end
+
+		e.tracer.Visible = ESP.tracers
+		if ESP.tracers then
+			e.tracer.From, e.tracer.To = tracerFrom, Vector2.new(cx, y + h)
+			e.tracer.Color, e.tracer.Thickness = color, thick
+		end
+
+		local used = 0
+		if ESP.skeleton then
+			for _, pair in ipairs(R15_BONES) do
+				local pa, pb = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
+				if pa and pb then
+					local a = cam:WorldToViewportPoint(pa.Position)
+					local b = cam:WorldToViewportPoint(pb.Position)
+					if a.Z > 0 and b.Z > 0 then
+						used += 1
+						local line = e.bones[used]
+						line.From, line.To = Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y)
+						line.Color, line.Thickness = color, thick
+						line.Visible = true
+					end
 				end
 			end
 		end
-	end
-	for i = used + 1, MAX_BONES do
-		e.bones[i].Visible = false
-	end
+		for i = used + 1, MAX_BONES do
+			e.bones[i].Visible = false
+		end
 
-	return true
-end
-
-local function espStep()
-	local cam = workspace.CurrentCamera
-	if not ESP.enabled or not cam then
-		for _, e in pairs(espEntries) do hideEntry(e) end
-		return
+		return true
 	end
 
-	local camPos = cam.CFrame.Position
-	local vp = cam.ViewportSize
-	local myChar = LocalPlayer.Character
-	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-	local origin = myRoot and myRoot.Position or camPos
-	losParams.FilterDescendantsInstances = { cam, myChar }
+	local function espStep()
+		local cam = workspace.CurrentCamera
+		if not ESP.enabled or not cam then
+			for _, e in pairs(espEntries) do hideEntry(e) end
+			return
+		end
 
-	local tracerFrom
-	if ESP.tracerOrigin == "Mouse" then
-		tracerFrom = UserInputService:GetMouseLocation()
-	elseif ESP.tracerOrigin == "Center" then
-		tracerFrom = vp / 2
-	else
-		tracerFrom = Vector2.new(vp.X / 2, vp.Y)
-	end
+		local camPos = cam.CFrame.Position
+		local vp = cam.ViewportSize
+		local myChar = LocalPlayer.Character
+		local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+		local origin = myRoot and myRoot.Position or camPos
+		losParams.FilterDescendantsInstances = { cam, myChar }
 
-	for player, e in pairs(espEntries) do
-		if not renderEntry(player, e, cam, camPos, origin, tracerFrom) then
-			hideEntry(e)
+		local tracerFrom
+		if ESP.tracerOrigin == "Mouse" then
+			tracerFrom = UserInputService:GetMouseLocation()
+		elseif ESP.tracerOrigin == "Center" then
+			tracerFrom = vp / 2
+		else
+			tracerFrom = Vector2.new(vp.X / 2, vp.Y)
+		end
+
+		for player, e in pairs(espEntries) do
+			if not renderEntry(player, e, cam, camPos, origin, tracerFrom) then
+				hideEntry(e)
+			end
 		end
 	end
-end
 
-local function addPlayer(player)
-	if player ~= LocalPlayer and not espEntries[player] then
-		espEntries[player] = newEntry()
+	local function addPlayer(player)
+		if player ~= LocalPlayer and not espEntries[player] then
+			espEntries[player] = newEntry()
+		end
 	end
-end
 
-local function removePlayer(player)
-	local e = espEntries[player]
-	if e then
-		espEntries[player] = nil
-		destroyEntry(e)
+	function removePlayer(player)
+		local e = espEntries[player]
+		if e then
+			espEntries[player] = nil
+			destroyEntry(e)
+		end
 	end
+
+	for _, player in ipairs(Players:GetPlayers()) do addPlayer(player) end
+	conns[#conns + 1] = Players.PlayerAdded:Connect(addPlayer)
+	conns[#conns + 1] = Players.PlayerRemoving:Connect(removePlayer)
+
+	-- one step after the aimlock, lined up with the same camera
+	RunService:BindToRenderStep(ESP_BIND, Enum.RenderPriority.Camera.Value + 2, espStep)
 end
-
-for _, player in ipairs(Players:GetPlayers()) do addPlayer(player) end
-conns[#conns + 1] = Players.PlayerAdded:Connect(addPlayer)
-conns[#conns + 1] = Players.PlayerRemoving:Connect(removePlayer)
-
--- one step after the aimlock, lined up with the same camera
-local ESP_BIND = randomName()
-RunService:BindToRenderStep(ESP_BIND, Enum.RenderPriority.Camera.Value + 2, espStep)
 
 ----------------------------------------------------------------------
 -- pages
@@ -10689,30 +11023,47 @@ section(aimPage, "Lock", 1)
 aimSwitch = toggle(aimPage, 2, "Aimlock", "Every shot and throw curves onto your target", AIM.enabled, setAimEnabled)
 cycler(aimPage, 3, "Aim at", { "Auto", "Head", "Torso" }, AIM.part, function(v) AIM.part = v end)
 cycler(aimPage, 4, "Pick target by", { "Cursor", "Distance" }, AIM.priority, function(v) AIM.priority = v end)
-toggle(aimPage, 5, "Lead moving targets", "Aims where they'll be when it lands, jumps too", AIM.lead, function(v)
-	AIM.lead = v
-end)
-toggle(aimPage, 6, "Ignore teammates", nil, AIM.teamCheck, function(v) AIM.teamCheck = v end)
-toggle(aimPage, 7, "Wall check", "Only picks up players you can see", AIM.wallCheck, function(v)
+toggle(aimPage, 5, "Ignore teammates", nil, AIM.teamCheck, function(v) AIM.teamCheck = v end)
+toggle(aimPage, 6, "Wall check", "Only picks up players you can see", AIM.wallCheck, function(v)
 	AIM.wallCheck = v
 end)
-toggle(aimPage, 8, "Skip telepearls", "A locked pearl would drop you onto them", AIM.skipPearls, function(v)
+toggle(aimPage, 7, "Skip telepearls", "A locked pearl would drop you onto them", AIM.skipPearls, function(v)
 	AIM.skipPearls = v
 end)
-slider(aimPage, 9, "Max distance", 100, 1500, AIM.maxDistance, " studs", function(v) AIM.maxDistance = v end)
+slider(aimPage, 8, "Max distance", 100, 1500, AIM.maxDistance, " studs", function(v) AIM.maxDistance = v end)
 
-section(aimPage, "FOV", 10)
-slider(aimPage, 11, "FOV radius", 40, 600, AIM.fov, " px", function(v) AIM.fov = v end)
-toggle(aimPage, 12, "Show FOV circle", "Turns green when someone's inside", AIM.showFov, function(v)
+section(aimPage, "Prediction", 9)
+toggle(aimPage, 10, "Lead moving targets", "Aims where the server will have them when it lands", AIM.lead, function(v)
+	AIM.lead = v
+end)
+cycler(aimPage, 11, "Movement model", { "Adaptive", "Straight", "Damped", "Pattern" }, AIM.model, function(v)
+	AIM.model = v
+	table.clear(pickCache)
+end)
+toggle(aimPage, 12, "Auto-tune lead", "Learns the server lead from the hits it confirms", AIM.autoTune, function(v)
+	AIM.autoTune = v
+end)
+slider(aimPage, 13, "Server lead tweak", -100, 150, AIM.latency * 1000, " ms", function(v)
+	AIM.latency = math.floor(v + 0.5) / 1000
+end)
+infoBox(aimPage, 14, 100, "The server decides every hit: it re-flies your shot against players where it had "
+	.. "them, ahead of what you see by your ping and then some. The aim leads by that, re-reading your ping "
+	.. "every quarter second, and <b>Auto-tune</b> keeps correcting it from the hits the server actually "
+	.. "confirms. <b>Adaptive</b> scores straight lead, damped lead and a pattern model on every player and "
+	.. "uses whichever has been landing on them.")
+
+section(aimPage, "FOV", 15)
+slider(aimPage, 16, "FOV radius", 40, 600, AIM.fov, " px", function(v) AIM.fov = v end)
+toggle(aimPage, 17, "Show FOV circle", "Turns green when someone's inside", AIM.showFov, function(v)
 	AIM.showFov = v
 end)
-toggle(aimPage, 13, "Target marker", "Dot on the spot your next shot goes", AIM.showMarker, function(v)
+toggle(aimPage, 18, "Target marker", "Dot on the spot your next shot goes", AIM.showMarker, function(v)
 	AIM.showMarker = v
 end)
 
-section(aimPage, "Live", 14)
-local liveInfo = infoBox(aimPage, 15, 64)
-infoBox(aimPage, 16, 72, "Your camera never moves. Bows, crossbows, headhunter, fireballs, snowballs and kit "
+section(aimPage, "Live", 19)
+local liveInfo = infoBox(aimPage, 20, 106)
+infoBox(aimPage, 21, 72, "Your camera never moves. Bows, crossbows, headhunter, fireballs, snowballs and kit "
 	.. "throwables keep the speed the game gave them and only change direction, so they curve onto the "
 	.. "target. Hold a bow to watch the aim beam bend onto them while you draw.")
 
@@ -10825,6 +11176,7 @@ local function unload()
 	end
 	pcall(RunService.UnbindFromRenderStep, RunService, AIM_BIND)
 	pcall(RunService.UnbindFromRenderStep, RunService, ESP_BIND)
+	if Tune.disconnect then pcall(Tune.disconnect) end
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for player in pairs(espEntries) do removePlayer(player) end
 	pcall(function() fovCircle:Remove() end)
@@ -10846,7 +11198,10 @@ if getgenv then
 	getgenv().__SHADEED_BW = {
 		State = State, AIM = AIM, ESP = ESP, KEYS = KEYS, unload = unload, espEntries = espEntries,
 		hooked = function() return HOOKABLE and Class.calculateImportantLaunchValues == hooked end,
-		pickTarget = pickTarget, currentTarget = currentTarget, steadiness = steadiness,
+		pickTarget = pickTarget, currentTarget = currentTarget, hist = hist, pickModel = pickModel,
+		scoreModels = scoreModels, patternAt = patternAt, dampedTau = dampedTau, serverLead = Tune.serverLead,
+		Tune = Tune,
+		HIST_HZ = HIST_HZ, HIST_LEN = HIST_LEN,
 		lock = function(v) lockHeld = v; if not v then lockedPlayer = nil end end,
 		eggShow = eggShow, easterEgg = easterEgg,
 		pools = function() return #ICON_POOL, #VIDEO_POOL, #REMOTE_POOL.images, #REMOTE_POOL.anims end,
@@ -10919,6 +11274,8 @@ end)
 task.spawn(function()
 	while State.running do
 		task.wait(0.25)
+		pcall(Tune.readPing)
+		pcall(Tune.resolve)
 		pcall(function()
 			local label, col = "Aimlock off", T.muted
 			if not HOOKABLE then
@@ -10943,9 +11300,16 @@ task.spawn(function()
 					and ('%s  <font color="#%s">· covered</font>'):format(held, T.accent:ToHex())
 					or (held .. "  · not a projectile")
 			end
+			local tuned = Tune.shots >= 3 and AIM.autoTune
+				and string.format("tuned %+dms from %d shots", math.floor(Tune.offset * 1000 + 0.5), Tune.shots)
+				or (AIM.autoTune and string.format("learning, %d/3 moving shots", Tune.shots) or "auto-tune off")
 			liveInfo.Text = string.format(
-				"Holding      %s\nLast shot    %s\nShots        %d locked · %d out of reach",
-				covered or "nothing", State.lastShot or "—", State.shots, State.outOfReach
+				"Holding      %s\nLast shot    %s\nAimed with   %s\nServer lead  %dms · ping %dms · %s\nServer hits  %s\nShots        %d locked · %d out of reach",
+				covered or "nothing", State.lastShot or "—", State.lastModel or "—",
+				math.floor(Tune.serverLead() * 1000 + 0.5), math.floor(Tune.ping * 1000 + 0.5), tuned,
+				State.resolved > 0 and string.format("%d/%d (%d%%) · %d headshots", State.confirmed, State.resolved,
+					math.floor(100 * State.confirmed / State.resolved + 0.5), State.headshots) or "—",
+				State.shots, State.outOfReach
 			)
 
 			controlsLbl.Text = string.format(
