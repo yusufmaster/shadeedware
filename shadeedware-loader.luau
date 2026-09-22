@@ -8767,13 +8767,13 @@ end)
 	{
 		name = "BedWars",
 		universeIds = { 2619619496 },
-		placeIds = { 6872265039, 8444591321 },
+		placeIds = { 6872265039, 6872274481, 8444591321 },
 		run = function()
 -- ===== begin bedwars-hub.luau =====
 --!nocheck
 --[[
 	SHADEEDWARE — BedWars
-	Projectile Aimlock · FOV circle · Lock keys
+	Projectile Aimlock · FOV circle · Lock keys · ESP
 
 	Read out of the live BedWars client (Game Mega, place version 4150):
 	  launch   -> every item projectile -- bows, crossbows, headhunter, fireballs, snowballs, kit
@@ -8927,11 +8927,13 @@ local protectgui = glob("protect_gui") or (syn and syn.protect_gui)
 local Drawing = glob("Drawing")
 local getgenv = glob("getgenv")
 
--- The standalone bedwars-aimlock.luau hooks the same launch function. Left running next to the
--- hub, every shot would be solved twice and the two FOV circles would fight.
+-- The standalone bedwars-aimlock.luau hooks the same launch function and esp.luau draws the same
+-- boxes. Left running next to the hub, every shot would be solved twice and everything drawn twice.
 if getgenv then
-	local old = getgenv().BedwarsAimlock
-	if type(old) == "table" and type(old.Unload) == "function" then pcall(old.Unload) end
+	for _, key in ipairs({ "BedwarsAimlock", "ESP" }) do
+		local old = getgenv()[key]
+		if type(old) == "table" and type(old.Unload) == "function" then pcall(old.Unload) end
+	end
 end
 
 ----------------------------------------------------------------------
@@ -9009,10 +9011,32 @@ local AIM = {
 	maxDistance = 1000,
 }
 
+local ESP = {
+	enabled = true,
+	chams = true,
+	boxes = true,
+	skeleton = true,
+	names = true,
+	distance = true,
+	heldItem = true, -- what they're holding, under the box
+	healthBars = true,
+	tracers = false,
+	tracerOrigin = "Bottom", -- "Bottom" | "Center" | "Mouse"
+	colorMode = "Visibility", -- "Visibility" = green in line of sight, red behind cover | "Team"
+	teamCheck = true,
+	maxDistance = 1500,
+	chamsFill = 0.65, -- fill transparency
+	textSize = 13,
+	thickness = 1,
+	color = Color3.fromRGB(255, 70, 70),
+	visibleColor = Color3.fromRGB(80, 255, 120),
+}
+
 local KEYS = {
 	menu = Enum.KeyCode.RightShift,
 	aimToggle = Enum.KeyCode.X,
 	lock = Enum.UserInputType.MouseButton2, -- any Enum.KeyCode or Enum.UserInputType
+	esp = Enum.KeyCode.Z,
 }
 
 local conns = {}
@@ -9113,6 +9137,9 @@ do
 		HOST_IS_VISIBLE = true
 	end
 end
+
+-- chams (Highlights) get their own folder beside the ScreenGui rather than inside it
+local espFolder = new("Folder", { Name = randomName(), Parent = gui.Parent })
 
 ----------------------------------------------------------------------
 -- avatar image resolution
@@ -9215,7 +9242,7 @@ new("TextLabel", {
 })
 new("TextLabel", {
 	Parent = card, Size = UDim2.new(1, 0, 0, 16), Position = UDim2.fromOffset(0, 178),
-	BackgroundTransparency = 1, Text = "projectile aimlock · fov circle · lock keys",
+	BackgroundTransparency = 1, Text = "projectile aimlock · esp · fov circle · lock keys",
 	Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.muted,
 })
 
@@ -10368,11 +10395,279 @@ RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, aimS
 conns[#conns + 1] = RunService.Heartbeat:Connect(trackPlayers)
 
 ----------------------------------------------------------------------
+-- ESP
+----------------------------------------------------------------------
+local BLACK = Color3.new(0, 0, 0)
+local WHITE = Color3.new(1, 1, 1)
+local HP_LOW = Color3.fromRGB(255, 60, 60)
+local HP_FULL = Color3.fromRGB(60, 255, 90)
+local FONT = Drawing and Drawing.Fonts and Drawing.Fonts.Plex or 2
+
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Exclude
+losParams.IgnoreWater = true
+
+local function hasLineOfSight(camPos, part, char)
+	local hit = workspace:Raycast(camPos, part.Position - camPos, losParams)
+	return not hit or hit.Instance:IsDescendantOf(char)
+end
+
+-- every BedWars character is R15
+local R15_BONES = {
+	{ "Head", "UpperTorso" },
+	{ "UpperTorso", "LowerTorso" },
+	{ "UpperTorso", "LeftUpperArm" },
+	{ "LeftUpperArm", "LeftLowerArm" },
+	{ "LeftLowerArm", "LeftHand" },
+	{ "UpperTorso", "RightUpperArm" },
+	{ "RightUpperArm", "RightLowerArm" },
+	{ "RightLowerArm", "RightHand" },
+	{ "LowerTorso", "LeftUpperLeg" },
+	{ "LeftUpperLeg", "LeftLowerLeg" },
+	{ "LeftLowerLeg", "LeftFoot" },
+	{ "LowerTorso", "RightUpperLeg" },
+	{ "RightUpperLeg", "RightLowerLeg" },
+	{ "RightLowerLeg", "RightFoot" },
+}
+local MAX_BONES = #R15_BONES
+local FLAT = { "boxOutline", "box", "name", "dist", "item", "hpOutline", "hp", "tracer" }
+
+local espEntries = {}
+
+local function newEntry()
+	local e = {
+		boxOutline = newDrawing("Square", { Filled = false, Color = BLACK, ZIndex = 1 }),
+		box = newDrawing("Square", { Filled = false, ZIndex = 2 }),
+		name = newDrawing("Text", { Center = true, Outline = true, OutlineColor = BLACK, Color = WHITE, Font = FONT, ZIndex = 3 }),
+		dist = newDrawing("Text", {
+			Center = true, Outline = true, OutlineColor = BLACK,
+			Color = Color3.fromRGB(205, 205, 205), Font = FONT, ZIndex = 3,
+		}),
+		item = newDrawing("Text", {
+			Center = true, Outline = true, OutlineColor = BLACK,
+			Color = Color3.fromRGB(255, 214, 110), Font = FONT, ZIndex = 3,
+		}),
+		hpOutline = newDrawing("Square", { Filled = true, Color = BLACK, ZIndex = 1 }),
+		hp = newDrawing("Square", { Filled = true, ZIndex = 2 }),
+		tracer = newDrawing("Line", { ZIndex = 1 }),
+		bones = table.create(MAX_BONES),
+		hl = Instance.new("Highlight"),
+	}
+	for i = 1, MAX_BONES do
+		e.bones[i] = newDrawing("Line", { ZIndex = 2 })
+	end
+	e.hl.Name = randomName()
+	e.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	e.hl.OutlineTransparency = 0
+	e.hl.Enabled = false
+	e.hl.Parent = espFolder
+	return e
+end
+
+local function hide2D(e)
+	for _, key in ipairs(FLAT) do
+		e[key].Visible = false
+	end
+	for _, line in ipairs(e.bones) do
+		line.Visible = false
+	end
+end
+
+local function hideEntry(e)
+	hide2D(e)
+	e.hl.Enabled = false
+end
+
+local function destroyEntry(e)
+	for _, key in ipairs(FLAT) do
+		pcall(function() e[key]:Remove() end)
+	end
+	for _, line in ipairs(e.bones) do
+		pcall(function() line:Remove() end)
+	end
+	e.hl:Destroy()
+end
+
+-- false = don't draw this player at all (dead, teammate, too far)
+local function renderEntry(player, e, cam, camPos, origin, tracerFrom)
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and hrp) or hum.Health <= 0 then return false end
+	if ESP.teamCheck and isTeammate(player) then return false end
+	local dist = (hrp.Position - origin).Magnitude
+	if dist > ESP.maxDistance then return false end
+
+	local head = char:FindFirstChild("Head")
+	local color = ESP.color
+	if ESP.colorMode == "Team" and player.Team then
+		color = player.Team.TeamColor.Color
+	elseif hasLineOfSight(camPos, head or hrp, char) then
+		color = ESP.visibleColor
+	end
+
+	-- chams are 3D, so they stay on even when the box would land off screen
+	local hl = e.hl
+	if ESP.chams then
+		if hl.Adornee ~= char then hl.Adornee = char end
+		if hl.FillColor ~= color then
+			hl.FillColor = color
+			hl.OutlineColor = color
+		end
+		if hl.FillTransparency ~= ESP.chamsFill then hl.FillTransparency = ESP.chamsFill end
+		hl.Enabled = true
+	else
+		hl.Enabled = false
+	end
+
+	-- box runs from the top of the head to the floor; R15 HipHeight is the gap under the HRP
+	local topWorld = head and head.Position + Vector3.new(0, head.Size.Y / 2 + 0.25, 0)
+		or hrp.Position + Vector3.new(0, 3, 0)
+	local bottomWorld = hrp.Position - Vector3.new(0, hrp.Size.Y / 2 + hum.HipHeight, 0)
+	local top = cam:WorldToViewportPoint(topWorld)
+	local bottom = cam:WorldToViewportPoint(bottomWorld)
+	if top.Z <= 0 or bottom.Z <= 0 then
+		hide2D(e)
+		return true
+	end
+
+	local h = math.max(bottom.Y - top.Y, 6)
+	local w = h * 0.55
+	local cx = (top.X + bottom.X) / 2
+	local x, y = math.floor(cx - w / 2), math.floor(top.Y)
+	w, h = math.floor(w), math.floor(h)
+	local thick = ESP.thickness
+
+	e.box.Visible, e.boxOutline.Visible = ESP.boxes, ESP.boxes
+	if ESP.boxes then
+		local pos, size = Vector2.new(x, y), Vector2.new(w, h)
+		e.box.Position, e.box.Size, e.box.Color, e.box.Thickness = pos, size, color, thick
+		e.boxOutline.Position, e.boxOutline.Size, e.boxOutline.Thickness = pos, size, thick + 2
+	end
+
+	e.name.Visible = ESP.names
+	if ESP.names then
+		e.name.Text = player.DisplayName
+		e.name.Size = ESP.textSize
+		e.name.Position = Vector2.new(cx, y - ESP.textSize - 2)
+	end
+
+	local below = y + h + 2
+	e.dist.Visible = ESP.distance
+	if ESP.distance then
+		e.dist.Text = math.floor(dist) .. " studs"
+		e.dist.Size = ESP.textSize - 1
+		e.dist.Position = Vector2.new(cx, below)
+		below += ESP.textSize
+	end
+
+	local held = ESP.heldItem and char:FindFirstChild("HandInvItem")
+	held = held and held.Value
+	e.item.Visible = held ~= nil
+	if held then
+		e.item.Text = (held.Name:gsub("_", " "))
+		e.item.Size = ESP.textSize - 1
+		e.item.Position = Vector2.new(cx, below)
+	end
+
+	e.hp.Visible, e.hpOutline.Visible = ESP.healthBars, ESP.healthBars
+	if ESP.healthBars then
+		local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+		local hpFill = math.floor(h * frac)
+		e.hpOutline.Position, e.hpOutline.Size = Vector2.new(x - 6, y - 1), Vector2.new(4, h + 2)
+		e.hp.Position, e.hp.Size = Vector2.new(x - 5, y + h - hpFill), Vector2.new(2, hpFill)
+		e.hp.Color = HP_LOW:Lerp(HP_FULL, frac)
+	end
+
+	e.tracer.Visible = ESP.tracers
+	if ESP.tracers then
+		e.tracer.From, e.tracer.To = tracerFrom, Vector2.new(cx, y + h)
+		e.tracer.Color, e.tracer.Thickness = color, thick
+	end
+
+	local used = 0
+	if ESP.skeleton then
+		for _, pair in ipairs(R15_BONES) do
+			local pa, pb = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
+			if pa and pb then
+				local a = cam:WorldToViewportPoint(pa.Position)
+				local b = cam:WorldToViewportPoint(pb.Position)
+				if a.Z > 0 and b.Z > 0 then
+					used += 1
+					local line = e.bones[used]
+					line.From, line.To = Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y)
+					line.Color, line.Thickness = color, thick
+					line.Visible = true
+				end
+			end
+		end
+	end
+	for i = used + 1, MAX_BONES do
+		e.bones[i].Visible = false
+	end
+
+	return true
+end
+
+local function espStep()
+	local cam = workspace.CurrentCamera
+	if not ESP.enabled or not cam then
+		for _, e in pairs(espEntries) do hideEntry(e) end
+		return
+	end
+
+	local camPos = cam.CFrame.Position
+	local vp = cam.ViewportSize
+	local myChar = LocalPlayer.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	local origin = myRoot and myRoot.Position or camPos
+	losParams.FilterDescendantsInstances = { cam, myChar }
+
+	local tracerFrom
+	if ESP.tracerOrigin == "Mouse" then
+		tracerFrom = UserInputService:GetMouseLocation()
+	elseif ESP.tracerOrigin == "Center" then
+		tracerFrom = vp / 2
+	else
+		tracerFrom = Vector2.new(vp.X / 2, vp.Y)
+	end
+
+	for player, e in pairs(espEntries) do
+		if not renderEntry(player, e, cam, camPos, origin, tracerFrom) then
+			hideEntry(e)
+		end
+	end
+end
+
+local function addPlayer(player)
+	if player ~= LocalPlayer and not espEntries[player] then
+		espEntries[player] = newEntry()
+	end
+end
+
+local function removePlayer(player)
+	local e = espEntries[player]
+	if e then
+		espEntries[player] = nil
+		destroyEntry(e)
+	end
+end
+
+for _, player in ipairs(Players:GetPlayers()) do addPlayer(player) end
+conns[#conns + 1] = Players.PlayerAdded:Connect(addPlayer)
+conns[#conns + 1] = Players.PlayerRemoving:Connect(removePlayer)
+
+-- one step after the aimlock, lined up with the same camera
+local ESP_BIND = randomName()
+RunService:BindToRenderStep(ESP_BIND, Enum.RenderPriority.Camera.Value + 2, espStep)
+
+----------------------------------------------------------------------
 -- pages
 ----------------------------------------------------------------------
 local aimPage, selectAim = makeTab("Aimlock", 1)
-local keysPage = makeTab("Keybinds", 2)
-local infoPage = makeTab("Info", 3)
+local espPage = makeTab("ESP", 2)
+local keysPage = makeTab("Keybinds", 3)
+local infoPage = makeTab("Info", 4)
 
 local aimSwitch -- setter for the Aimlock switch, so its key can flip it too
 local function setAimEnabled(v)
@@ -10380,6 +10675,13 @@ local function setAimEnabled(v)
 	if not v then lockHeld, lockedPlayer = false, nil end
 	if aimSwitch then aimSwitch(v) end
 	notify("Aimlock " .. (v and "on" or "off"))
+end
+
+local espSwitch
+local function setEspEnabled(v)
+	ESP.enabled = v
+	if espSwitch then espSwitch(v) end
+	notify("ESP " .. (v and "on" or "off"))
 end
 
 -- Aimlock -------------------------------------------------------------
@@ -10414,6 +10716,35 @@ infoBox(aimPage, 16, 72, "Your camera never moves. Bows, crossbows, headhunter, 
 	.. "throwables keep the speed the game gave them and only change direction, so they curve onto the "
 	.. "target. Hold a bow to watch the aim beam bend onto them while you draw.")
 
+-- ESP -----------------------------------------------------------------
+section(espPage, "Players", 1)
+espSwitch = toggle(espPage, 2, "ESP", "Every enemy, through walls", ESP.enabled, setEspEnabled)
+toggle(espPage, 3, "Chams", "Coloured outline and fill on their body", ESP.chams, function(v) ESP.chams = v end)
+toggle(espPage, 4, "Boxes", nil, ESP.boxes, function(v) ESP.boxes = v end)
+toggle(espPage, 5, "Skeleton", nil, ESP.skeleton, function(v) ESP.skeleton = v end)
+toggle(espPage, 6, "Names", nil, ESP.names, function(v) ESP.names = v end)
+toggle(espPage, 7, "Distance", nil, ESP.distance, function(v) ESP.distance = v end)
+toggle(espPage, 8, "Held item", "Bow, fireball, sword — whatever they have out", ESP.heldItem, function(v)
+	ESP.heldItem = v
+end)
+toggle(espPage, 9, "Health bars", nil, ESP.healthBars, function(v) ESP.healthBars = v end)
+toggle(espPage, 10, "Tracers", nil, ESP.tracers, function(v) ESP.tracers = v end)
+cycler(espPage, 11, "Tracers from", { "Bottom", "Center", "Mouse" }, ESP.tracerOrigin, function(v)
+	ESP.tracerOrigin = v
+end)
+
+section(espPage, "Filters", 12)
+cycler(espPage, 13, "Colours", { "Visibility", "Team" }, ESP.colorMode, function(v) ESP.colorMode = v end)
+toggle(espPage, 14, "Ignore teammates", nil, ESP.teamCheck, function(v) ESP.teamCheck = v end)
+slider(espPage, 15, "Max distance", 100, 5000, ESP.maxDistance, " studs", function(v) ESP.maxDistance = v end)
+
+section(espPage, "Look", 16)
+slider(espPage, 17, "Chams fill", 0, 1, 1 - ESP.chamsFill, "", function(v) ESP.chamsFill = 1 - v end)
+slider(espPage, 18, "Text size", 9, 21, ESP.textSize, " px", function(v) ESP.textSize = math.floor(v + 0.5) end)
+infoBox(espPage, 19, 46, Drawing
+	and "Visibility colours: green when you can see them, red behind cover. Team colours: their bed colour."
+	or "This executor has no Drawing API, so boxes, names and tracers are off. Chams still work.")
+
 -- Keybinds ------------------------------------------------------------
 section(keysPage, "Aimlock", 1)
 keybind(keysPage, 2, "On / off", KEYS.aimToggle, function(k)
@@ -10435,12 +10766,18 @@ infoBox(keysPage, 5, 72, "<b>Always</b> — every shot goes to whoever is neares
 	.. "<b>Hold</b> — only while the lock key is down, and it sticks to one player until you let go.\n"
 	.. "<b>Toggle</b> — tap to lock onto someone, tap again to let go.")
 
-section(keysPage, "Window", 6)
-keybind(keysPage, 7, "Show / hide menu", KEYS.menu, function(k)
+section(keysPage, "ESP", 6)
+keybind(keysPage, 7, "On / off", KEYS.esp, function(k)
+	KEYS.esp = k
+	notify("ESP on / off: " .. keyName(k))
+end)
+
+section(keysPage, "Window", 8)
+keybind(keysPage, 9, "Show / hide menu", KEYS.menu, function(k)
 	KEYS.menu = k
 	notify("Menu key: " .. keyName(k))
 end)
-infoBox(keysPage, 8, 46, "Click a key, then press the new one — a mouse button works too. Esc cancels. "
+infoBox(keysPage, 10, 46, "Click a key, then press the new one — a mouse button works too. Esc cancels. "
 	.. "BedWars already uses both Ctrl keys for shift lock.")
 
 -- Info ----------------------------------------------------------------
@@ -10487,13 +10824,16 @@ local function unload()
 		Class.calculateImportantLaunchValues = original
 	end
 	pcall(RunService.UnbindFromRenderStep, RunService, AIM_BIND)
+	pcall(RunService.UnbindFromRenderStep, RunService, ESP_BIND)
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	for player in pairs(espEntries) do removePlayer(player) end
 	pcall(function() fovCircle:Remove() end)
 	pcall(function() aimDot:Remove() end)
 	fadeGroup(win, 0, 0.18)
 	tween(winScale, 0.2, { Scale = 0.9 })
 	task.delay(0.28, function()
 		gui:Destroy()
+		espFolder:Destroy()
 		if unloadBeacon then unloadBeacon:Destroy() end
 	end)
 	if getgenv then getgenv().__SHADEED_BW = nil end
@@ -10504,7 +10844,7 @@ if unloadBeacon then unloadBeacon.Event:Connect(unload) end
 -- debug handle for the MCP; lives in the executor's env, which game scripts can't read
 if getgenv then
 	getgenv().__SHADEED_BW = {
-		State = State, AIM = AIM, KEYS = KEYS, unload = unload,
+		State = State, AIM = AIM, ESP = ESP, KEYS = KEYS, unload = unload, espEntries = espEntries,
 		hooked = function() return HOOKABLE and Class.calculateImportantLaunchValues == hooked end,
 		pickTarget = pickTarget, currentTarget = currentTarget, steadiness = steadiness,
 		lock = function(v) lockHeld = v; if not v then lockedPlayer = nil end end,
@@ -10554,6 +10894,9 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
 	end
 	if matchesKey(i, KEYS.aimToggle) then
 		setAimEnabled(not AIM.enabled)
+	end
+	if matchesKey(i, KEYS.esp) then
+		setEspEnabled(not ESP.enabled)
 	end
 	if AIM.mode ~= "Always" and matchesKey(i, KEYS.lock) then
 		if AIM.mode == "Hold" then
@@ -10606,8 +10949,8 @@ task.spawn(function()
 			)
 
 			controlsLbl.Text = string.format(
-				"%s — hide / show this window\n%s — aimlock on / off\n%s\n× — unload the hub and hand aiming back to the game",
-				keyName(KEYS.menu), keyName(KEYS.aimToggle),
+				"%s — hide / show this window\n%s — aimlock on / off · %s — ESP on / off\n%s\n× — unload the hub and hand aiming back to the game",
+				keyName(KEYS.menu), keyName(KEYS.aimToggle), keyName(KEYS.esp),
 				AIM.mode == "Always" and "Aimlock locks onto whoever is in the circle"
 					or string.format("%s %s — lock onto the player in the circle",
 						AIM.mode == "Hold" and "Hold" or "Tap", keyName(KEYS.lock))
