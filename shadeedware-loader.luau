@@ -8994,6 +8994,7 @@ local State = {
 	resolved = 0, -- shots the server has ruled on
 	confirmed = 0, -- of those, hits the server counted
 	headshots = 0,
+	items = {}, -- the same counts per item family (ITEMS keys)
 	lastShot = nil,
 	lastError = nil,
 	relay = "connecting…", -- the controller's popup relay, for the Info tab
@@ -9002,7 +9003,6 @@ local State = {
 local AIM = {
 	enabled = true,
 	mode = "Always", -- "Always" | "Hold" | "Toggle"
-	part = "Auto", -- "Auto" = head for headhunter arrows (they can headshot), torso for the rest
 	priority = "Cursor", -- "Cursor" | "Distance"
 	fov = 200,
 	showFov = true,
@@ -9047,6 +9047,32 @@ local KEYS = {
 	lock = Enum.UserInputType.MouseButton2, -- any Enum.KeyCode or Enum.UserInputType
 	esp = Enum.KeyCode.Z,
 }
+
+-- Per-item aim profiles. Every item family has its own switch, aim point and full-power setting,
+-- and learns its own server lead and keeps its own hit counts, so tuning one never moves another.
+-- Matched on the launcher's item name (the projectile's when there's no item); first match wins,
+-- which is why the headhunter and crossbow come before the plain bow.
+--   aim        "Auto" = headshots for items that score them, body otherwise | "Head" | "Body"
+--   fullPower  a half-drawn shot leaves at full-draw speed and damage. The server takes it: quick-tap
+--              bow shots went 4 of 5 with it and 0 of 6 without (99 sps arrows, 1.6s flights).
+local ITEMS = {
+	{ key = "Headhunter", label = "Headhunter", match = { "headhunter" }, enabled = true, aim = "Auto", headshots = true },
+	{ key = "Crossbow", label = "Crossbow", match = { "crossbow" }, enabled = true, aim = "Body" },
+	{ key = "Bow", label = "Bow", match = { "bow" }, enabled = true, aim = "Body", fullPower = true, chargeable = true },
+	{ key = "Fireball", label = "Fireball", match = { "fireball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true },
+	{ key = "Snowball", label = "Snowballs", match = { "snowball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true },
+	{ key = "Other", label = "Everything else", match = {}, enabled = true, aim = "Body" },
+}
+
+local function itemProfile(itemName, projectile)
+	local name, proj = string.lower(itemName or ""), string.lower(projectile or "")
+	for _, prof in ipairs(ITEMS) do
+		for _, m in ipairs(prof.match) do
+			if name:find(m, 1, true) or proj:find(m, 1, true) then return prof end
+		end
+	end
+	return ITEMS[#ITEMS]
+end
 
 local conns = {}
 
@@ -10065,6 +10091,10 @@ local LEAD_TAU_MIN, LEAD_TAU_MAX = 0.3, 4
 -- Past this much flight the head is too small to lead reliably, so Auto sends headhunter arrows
 -- at the body instead.
 local HEADSHOT_MAX_FLIGHT = 0.45
+-- Where headshots are aimed, in studs above the root. Measured from the server's own headshot
+-- flag: hits passing below +1.53 counted as body, +1.53 to +3.0 as headshots. The visible head
+-- (+0.9..+1.9) sits mostly below that band, so aiming at it scored 1 headshot in 3.
+local HEADSHOT_HEIGHT = 2.2
 local ARC_CHECKS = 8
 -- The server re-flies every shot and checks it against players rewound to launch - 45ms + flight,
 -- while we see them a network delay in the past. Measured: its check matched our view 0.1s ahead
@@ -10118,7 +10148,7 @@ local function recordPlayers()
 		end
 		local h = hist[player]
 		if not h or h.root ~= root then
-			h = { root = root, n = 0, last = -1, run = 0, t = {}, px = {}, py = {}, pz = {}, vx = {}, vz = {}, turn = {} }
+			h = { root = root, n = 0, last = -1, run = 0, t = {}, px = {}, py = {}, pz = {}, vx = {}, vy = {}, vz = {}, turn = {} }
 			hist[player] = h
 		end
 		if now - h.last >= 1 / HIST_HZ - 0.002 then
@@ -10126,7 +10156,7 @@ local function recordPlayers()
 			local p, v = root.Position, root.AssemblyLinearVelocity
 			h.n += 1
 			local s = slot(h.n)
-			h.t[s], h.px[s], h.py[s], h.pz[s], h.vx[s], h.vz[s] = now, p.X, p.Y, p.Z, v.X, v.Z
+			h.t[s], h.px[s], h.py[s], h.pz[s], h.vx[s], h.vy[s], h.vz[s] = now, p.X, p.Y, p.Z, v.X, v.Y, v.Z
 			-- seconds since their heading last swung past 60 degrees, or they stopped
 			local speed = math.sqrt(v.X * v.X + v.Z * v.Z)
 			if speed < 3 then
@@ -10255,8 +10285,9 @@ local function pickModel(player, h, H)
 	return model
 end
 
--- Server lead and auto-tune share one table so the script stays under Luau's 200-local limit.
-local Tune = { shots = 0, offset = 0, ping = 0.036 }
+-- Server lead and auto-tune share one table so the script stays under Luau's 200-local limit. Each
+-- item family learns its own lead; until one has 6 shots of its own it borrows the combined one.
+local Tune = { ping = 0.036 }
 do
 	local pingRead = false
 
@@ -10282,13 +10313,43 @@ do
 	local TUNE_MIN, TUNE_MAX, TUNE_STEP = -0.15, 0.30, 0.005
 	local TUNE_BINS = math.floor((TUNE_MAX - TUNE_MIN) / TUNE_STEP + 0.5) + 1
 	local TUNE_DECAY = 0.97 -- older shots fade: a changed connection is relearned in ~30 shots
-	local scores = table.create(TUNE_BINS, 0)
-	local pending = {}
-	Tune.scores, Tune.pending = scores, pending
+	-- Every track starts with a small bump at the ping formula that real shots have to outvote. On
+	-- replayed shots it cut the error while learning from 14ms to 2ms; it fades with the decay.
+	local PRIOR_WEIGHT, PRIOR_WIDTH = 1.5, 0.06
+	-- an item keeps borrowing the combined lead until its own has this many shots behind it
+	local OWN_TRACK_MIN = 6
+	local function newTrack()
+		local scores = table.create(TUNE_BINS, 0)
+		for i = 1, TUNE_BINS do
+			local offset = TUNE_MIN + (i - 1) * TUNE_STEP
+			scores[i] = PRIOR_WEIGHT * math.exp(-(offset / PRIOR_WIDTH) ^ 2)
+		end
+		return { scores = scores, shots = 0, offset = 0 }
+	end
+	local all, byItem, pending = newTrack(), {}, {}
+	Tune.all, Tune.byItem, Tune.pending = all, byItem, pending
 
-	function Tune.serverLead()
-		local learned = AIM.autoTune and Tune.shots >= 3 and Tune.offset or 0
+	-- where an item's lead comes from: its own track once that has OWN_TRACK_MIN shots, else the combined one
+	function Tune.trackFor(item)
+		local t = item and byItem[item]
+		if t and t.shots >= OWN_TRACK_MIN then return t, true end
+		return all, false
+	end
+
+	function Tune.serverLead(item)
+		local t = Tune.trackFor(item)
+		local learned = AIM.autoTune and t.shots >= 3 and t.offset or 0
 		return baseLead(Tune.ping) + learned + AIM.latency
+	end
+
+	-- hit counts per item family
+	function Tune.stats(item)
+		local s = State.items[item]
+		if not s then
+			s = { shots = 0, resolved = 0, confirmed = 0, headshots = 0 }
+			State.items[item] = s
+		end
+		return s
 	end
 
 	-- a real shot, queued for the server's verdict
@@ -10323,13 +10384,36 @@ do
 			local span = h.t[b] - h.t[a]
 			local u = span > 0 and (t - h.t[a]) / span or 0
 			local dy = o.Y + v.Y * tau - 0.5 * g * tau * tau - (h.py[a] + (h.py[b] - h.py[a]) * u)
-			if dy >= -3.5 and dy <= 2.5 then
+			-- the hittable height band, measured with the server's own damage and headshot flags
+			-- (arrow height minus root: body -3.1.., headshots up to +3.0). A cap at +2.5 here called
+			-- every headshot-height arrow a miss and taught the headhunter a -50ms lead.
+			if dy >= -3.15 and dy <= 3.05 then
 				local dx = o.X + v.X * tau - (h.px[a] + (h.px[b] - h.px[a]) * u)
 				local dz = o.Z + v.Z * tau - (h.pz[a] + (h.pz[b] - h.pz[a]) * u)
 				if dx * dx + dz * dz <= tol2 then return true end
 			end
 		end
 		return false
+	end
+
+	local function absorb(t, votes)
+		t.shots += 1
+		local scores = t.scores
+		for i = 1, TUNE_BINS do
+			scores[i] = scores[i] * TUNE_DECAY + votes[i]
+		end
+		-- The best offset after a light smoothing, ties going to the one nearest the ping formula.
+		-- Replayed on recorded shots with the formula made wrong by up to 100ms, this landed on the
+		-- measured lead every time; taking the middle of the tied run drifted between runs instead.
+		local bestOffset, best = 0, -1
+		for i = 1, TUNE_BINS do
+			local sm = (scores[math.max(i - 1, 1)] + scores[i] + scores[math.min(i + 1, TUNE_BINS)]) / 3
+			local offset = TUNE_MIN + (i - 1) * TUNE_STEP
+			if sm > best + 1e-9 or (math.abs(sm - best) <= 1e-9 and math.abs(offset) < math.abs(bestOffset)) then
+				bestOffset, best = offset, sm
+			end
+		end
+		t.offset = bestOffset
 	end
 
 	function Tune.learn(shot)
@@ -10348,22 +10432,11 @@ do
 		end
 		-- a shot every offset agrees on (a standing target, a miss by miles) says nothing about the lead
 		if not informative then return end
-		Tune.shots += 1
-		for i = 1, TUNE_BINS do
-			scores[i] = scores[i] * TUNE_DECAY + votes[i]
+		absorb(all, votes)
+		if shot.item then
+			byItem[shot.item] = byItem[shot.item] or newTrack()
+			absorb(byItem[shot.item], votes)
 		end
-		-- The best offset after a light smoothing, ties going to the one nearest the ping formula.
-		-- Replayed on recorded shots with the formula made wrong by up to 100ms, this landed on the
-		-- measured lead every time; taking the middle of the tied run drifted between runs instead.
-		local bestOffset, best = 0, -1
-		for i = 1, TUNE_BINS do
-			local sm = (scores[math.max(i - 1, 1)] + scores[i] + scores[math.min(i + 1, TUNE_BINS)]) / 3
-			local offset = TUNE_MIN + (i - 1) * TUNE_STEP
-			if sm > best + 1e-9 or (math.abs(sm - best) <= 1e-9 and math.abs(offset) < math.abs(bestOffset)) then
-				bestOffset, best = offset, sm
-			end
-		end
-		Tune.offset = bestOffset
 	end
 
 	function Tune.resolve()
@@ -10376,6 +10449,12 @@ do
 				State.resolved += 1
 				if shot.hit then State.confirmed += 1 end
 				if shot.headshot then State.headshots += 1 end
+				if shot.item then
+					local s = Tune.stats(shot.item)
+					s.resolved += 1
+					if shot.hit then s.confirmed += 1 end
+					if shot.headshot then s.headshots += 1 end
+				end
 				local ok, err = pcall(Tune.learn, shot)
 				if not ok then State.lastError = tostring(err) end
 			else
@@ -10410,7 +10489,8 @@ local lastLocked = nil
 
 -- `name` is a projectile type or a held item; every headhunter variant has it in its name.
 local function wantsHead(name)
-	return AIM.part == "Head" or (AIM.part == "Auto" and name ~= nil and name:find("headhunter") ~= nil)
+	local prof = itemProfile(name, name)
+	return prof.aim == "Head" or (prof.aim == "Auto" and prof.headshots == true)
 end
 
 local function isTeammate(player)
@@ -10490,10 +10570,88 @@ local function currentTarget(wantHead)
 	return player, part, root, hum
 end
 
+-- Up and down, per player. Where they land is where their own root has been lowest over the last
+-- 1.5 seconds, not a ray straight down, which slipped through gaps and bridge edges and aimed into
+-- the void. "In the air" goes by height above that as well as by speed, so the top of a jump (speed
+-- ~0) no longer reads as standing, which sent headshots over the heads of jumpers.
+local Vert = {}
+do
+	local FLOOR_SPAN = math.floor(1.5 * HIST_HZ)
+	local AIR_GAP = 0.3
+	-- measured with the server's headshot flag (see HEADSHOT_HEIGHT), arrow height minus root height
+	local HEAD_LO, HEAD_HI, HIT_LO, HIT_HI = 1.53, 3.0, -3.1, 3.0
+
+	-- lowest root height over the FLOOR_SPAN samples up to j
+	function Vert.floorAt(h, j)
+		local f = math.huge
+		for k = math.max(oldest(h), j - FLOOR_SPAN), j do
+			local y = h.py[slot(k)]
+			if y < f then f = y end
+		end
+		return f
+	end
+
+	-- root height `t` seconds after sample j, from what was known at j
+	function Vert.rootAt(h, j, t)
+		local s = slot(j)
+		local y, vy = h.py[s], h.vy[s]
+		local f = Vert.floorAt(h, j)
+		if y <= f + AIR_GAP and math.abs(vy) <= 2 then return y end
+		return math.max(y + vy * t - 0.5 * workspace.Gravity * t * t, f)
+	end
+
+	-- Per player: how their height has been surprising Vert.rootAt at this flight time, replayed over
+	-- their last 3 seconds, and the head and body aim heights (above the root) that would have landed
+	-- most often. Headshots count first for the head aim; ties stay nearest the defaults. Jumpers get
+	-- aimed higher, because when they surprise the model it's by jumping again. Tuned on a recorded
+	-- spam-jumper: +4-5% headshots and +3-5% hits at 0.45-0.6s of flight.
+	local cache = {}
+	Vert.cache = cache
+	function Vert.aimHeights(player, h, H)
+		local bucket = math.floor(H * 20 + 0.5)
+		local now = os.clock()
+		local c = cache[player]
+		if c and c.bucket == bucket and (c.n == h.n or now - c.at < PICK_CACHE) then return c.head, c.body end
+		local hs = math.floor(H * HIST_HZ + 0.5)
+		local res = {}
+		for j = math.max(oldest(h) + FLOOR_SPAN, h.n - hs - 3 * HIST_HZ), h.n - hs, 2 do
+			res[#res + 1] = h.py[slot(j + hs)] - Vert.rootAt(h, j, H)
+		end
+		local head, body = HEADSHOT_HEIGHT, 0
+		if #res >= 8 then
+			local best = -1
+			for a10 = 12, 30 do
+				local a, score = a10 / 10, 0
+				for _, r in ipairs(res) do
+					local rel = a - r
+					if rel >= HEAD_LO and rel <= HEAD_HI then score += 10 end
+					if rel >= HIT_LO and rel <= HIT_HI then score += 1 end
+				end
+				if score > best or (score == best and math.abs(a - HEADSHOT_HEIGHT) < math.abs(head - HEADSHOT_HEIGHT)) then
+					best, head = score, a
+				end
+			end
+			best = -1
+			for b10 = -15, 15 do
+				local b, score = b10 / 10, 0
+				for _, r in ipairs(res) do
+					local rel = b - r
+					if rel >= HIT_LO and rel <= HIT_HI then score += 1 end
+				end
+				if score > best or (score == best and math.abs(b) < math.abs(body)) then
+					best, body = score, b
+				end
+			end
+		end
+		cache[player] = { at = now, bucket = bucket, n = h.n, head = head, body = body }
+		return head, body
+	end
+end
+
 -- Where `part` will be `t` seconds after launch, as the server will check it: `ahead` seconds past
 -- what we can see. Across the ground: the model picked for this player at total horizon H (straight
--- lead when H is nil). Up and down: level unless they're rising or falling, then a jump arc under
--- workspace gravity that lands on the ground under their feet.
+-- lead when H is nil). Up and down: Vert's model on the live root, a jump arc that lands where they
+-- have been landing.
 local function predictor(player, part, root, hum, ahead, H)
 	local start = part.Position
 	if not AIM.lead then
@@ -10521,25 +10679,39 @@ local function predictor(player, part, root, hum, ahead, H)
 	lead = lead or function(t) return vel.X * t, vel.Z * t end
 
 	local gravity = workspace.Gravity
-	local airborne = math.abs(vel.Y) > 2
-	local lowest = -math.huge
-	if airborne then
+	local rootY, partOff = root.Position.Y, start.Y - root.Position.Y
+	local function groundBelow()
 		groundParams.FilterDescendantsInstances = { root.Parent, workspace.CurrentCamera, LocalPlayer.Character }
 		local ground = workspace:Blockcast(CFrame.new(root.Position), FOOTPRINT, Vector3.new(0, -GROUND_PROBE, 0), groundParams)
-		if ground then
-			local standHeight = hum.RigType == Enum.HumanoidRigType.R15 and hum.HipHeight + root.Size.Y / 2 or 3
-			lowest = math.min(ground.Position.Y + standHeight + (start.Y - root.Position.Y), start.Y)
+		if not ground then return -math.huge end
+		local standHeight = hum.RigType == Enum.HumanoidRigType.R15 and hum.HipHeight + root.Size.Y / 2 or 3
+		return math.min(ground.Position.Y + standHeight, rootY)
+	end
+
+	local airborne, floorY
+	if AIM.debugLegacyVertical then
+		-- the old model, kept for A/B tests only: airborne by speed alone, the ground straight below
+		airborne = math.abs(vel.Y) > 2
+		floorY = airborne and groundBelow() or -math.huge
+	else
+		local hFloor = h and h.n > 0 and Vert.floorAt(h, h.n) or nil
+		if hFloor and rootY >= hFloor - 0.5 then
+			floorY = math.min(hFloor, rootY)
+		else
+			-- no history yet, or already dropping below where they've been: the ground under their feet
+			floorY = groundBelow()
 		end
+		airborne = rootY > floorY + 0.3 or math.abs(vel.Y) > 2
 	end
 
 	return function(t)
 		t += ahead
 		local dx, dz = lead(t)
-		local y = start.Y
+		local y = rootY
 		if airborne then
-			y = math.max(start.Y + vel.Y * t - 0.5 * gravity * t * t, lowest)
+			y = math.max(rootY + vel.Y * t - 0.5 * gravity * t * t, floorY)
 		end
-		return Vector3.new(start.X + dx, y, start.Z + dz)
+		return Vector3.new(start.X + dx, y + partOff, start.Z + dz)
 	end, model
 end
 
@@ -10586,17 +10758,31 @@ local function solveIntercept(origin, speed, gravity, predict, maxTime)
 	return nil
 end
 
-local function redirect(handler, launch, isPreview)
+local function redirect(handler, launch, isPreview, tool)
 	local projectile = handler.projectile
 	if type(projectile) ~= "string" or projectile:lower():find("turret") then
 		return -- turrets pick their own targets
 	end
+	local itemName = typeof(tool) == "Instance" and tool.Name or nil
+	local prof = itemProfile(itemName, projectile)
+	if not prof.enabled then return end
+	-- full power: a half-drawn shot leaves at the speed, and with the damage, of a full draw
+	local vm = handler.velocityMultiplier
+	if prof.fullPower and type(vm) == "number" and vm > 0 and vm < 0.999 then
+		launch.initialVelocity /= vm
+		local meta = itemName and ItemMeta and ItemMeta[itemName]
+		local full = meta and meta.projectileSource and meta.projectileSource.maxStrengthChargeSec
+		if full then launch.drawDurationSeconds = math.max(launch.drawDurationSeconds or 0, full) end
+	end
+	-- (Faster than a full draw doesn't work: 2x bow speed went 0 for 3 even on a standing target, so
+	-- the server checks the speed against the item's own maximum.)
 	if AIM.skipPearls and projectile == "telepearl" then return end
 	local from = launch.positionFrom
 	local speed = launch.initialVelocity.Magnitude
 	if not from or speed < 1 then return end
 
-	local player, part, root, hum = currentTarget(wantsHead(projectile))
+	local wantHead = prof.aim == "Head" or (prof.aim == "Auto" and prof.headshots == true)
+	local player, part, root, hum = currentTarget(wantHead)
 	if not player then return end
 
 	local meta = handler:getProjectileMeta()
@@ -10606,15 +10792,23 @@ local function redirect(handler, launch, isPreview)
 	-- The chosen part first, then the other one: when a wall covers the body the head is often
 	-- still in the open, and the other way round.
 	local char = root.Parent
-	local head = char:FindFirstChild("Head")
-	local candidates = { part }
-	if part ~= root then
-		candidates[2] = root
+	-- the headshot point: inside the band the server scores as a headshot, not the visible head
+	local head = char:FindFirstChild("Head") and { Position = root.Position + Vector3.new(0, HEADSHOT_HEIGHT, 0), Name = "Head" }
+	local candidates
+	if part ~= root and head then
+		candidates = { head, root }
 	elseif head then
-		candidates[2] = head
+		candidates = { root, head }
+	else
+		candidates = { root }
+	end
+	-- AIM.testHeight (debug handle only): a fixed height above the root, for mapping where the
+	-- server scores headshots
+	if AIM.testHeight then
+		candidates = { { Position = root.Position + Vector3.new(0, AIM.testHeight, 0), Name = "height " .. AIM.testHeight } }
 	end
 
-	local ahead = Tune.serverLead()
+	local ahead = Tune.serverLead(prof.key)
 	local shots = {}
 	for _, aimPart in ipairs(candidates) do
 		-- Solve from positionFrom, move the origin to where that direction really spawns the model,
@@ -10628,21 +10822,34 @@ local function redirect(handler, launch, isPreview)
 			if not dir then break end
 		end
 		local model = AIM.lead and "Straight" or "Off"
+		local aimY = aimPart.Position.Y - root.Position.Y
 		if dir and AIM.lead then
-			local predict2, picked = predictor(player, aimPart, root, hum, ahead, flight + ahead)
-			if picked ~= "Straight" then
+			local H = flight + ahead
+			-- this player's learned aim height at this flight time, for the head or the body
+			local aim2 = aimPart
+			local h = hist[player]
+			if h and h.n > LAG2 and not AIM.testHeight and not AIM.debugLegacyVertical then
+				local headY, bodyY = Vert.aimHeights(player, h, H)
+				local y = aimPart == head and headY or bodyY
+				if math.abs(y - aimY) > 0.01 then
+					aim2 = { Position = root.Position + Vector3.new(0, y, 0), Name = aimPart.Name }
+				end
+			end
+			local predict2, picked = predictor(player, aim2, root, hum, ahead, H)
+			if picked ~= "Straight" or aim2 ~= aimPart then
 				local spawn2 = (CFrame.lookAt(from, from + dir) * SPAWN_OFFSET).Position
 				local dir2, flight2 = solveIntercept(spawn2, speed, gravity, predict2, lifetime)
 				if dir2 then
 					dir, flight, spawn, model = dir2, flight2, spawn2, picked
+					aimY = aim2.Position.Y - root.Position.Y
 				end
 			end
 		end
 		if dir then
 			shots[#shots + 1] = {
-				dir = dir, flight = flight, spawn = spawn, part = aimPart, model = model,
+				dir = dir, flight = flight, spawn = spawn, part = aimPart, model = model, aimY = aimY,
 				clear = arcIsClear(spawn, dir * speed, gravity, flight, char),
-				farHead = aimPart == head and AIM.part == "Auto" and flight > HEADSHOT_MAX_FLIGHT,
+				farHead = aimPart == head and prof.aim == "Auto" and flight > HEADSHOT_MAX_FLIGHT,
 			}
 		end
 	end
@@ -10667,20 +10874,21 @@ local function redirect(handler, launch, isPreview)
 
 	if not isPreview then
 		State.shots += 1
-		State.lastShot = string.format("%s %d sps → %s · %.2fs%s", projectile, math.floor(speed + 0.5),
+		Tune.stats(prof.key).shots += 1
+		State.lastShot = string.format("%s: %s %d sps → %s · %.2fs%s", prof.label, projectile, math.floor(speed + 0.5),
 			player.DisplayName, pick.flight, pick.part == head and " · head" or "")
-		State.lastModel = string.format("%s · server lead %dms", pick.model, math.floor(ahead * 1000 + 0.5))
+		State.lastModel = string.format("%s · server lead %dms · aim %+.1f", pick.model, math.floor(ahead * 1000 + 0.5), pick.aimY)
 		State.lastLaunch = {
 			at = os.clock(), origin = pick.spawn, velocity = launch.initialVelocity, gravity = gravity,
 			flight = pick.flight, target = player, part = pick.part.Name, clear = pick.clear,
-			model = pick.model, ahead = ahead,
+			model = pick.model, ahead = ahead, aimY = pick.aimY,
 		}
 		-- queued for the server's verdict, which auto-tune learns the lead from
 		local h = hist[player]
 		if h then
 			Tune.queue({
 				at = os.clock(), origin = pick.spawn, velocity = launch.initialVelocity, gravity = gravity,
-				flight = pick.flight, char = char, h = h,
+				flight = pick.flight, char = char, h = h, item = prof.key,
 			})
 		end
 	end
@@ -10690,7 +10898,8 @@ local function hooked(self, handler, isPreview, ...)
 	local launch = original(self, handler, isPreview, ...)
 	-- State.running guards a copy that outlived its unload (something else hooked on top of it)
 	if State.running and AIM.enabled and launch and handler then
-		local ok, err = pcall(redirect, handler, launch, isPreview)
+		-- the launcher's tool comes through as the first extra argument (item launches and the aim beam)
+		local ok, err = pcall(redirect, handler, launch, isPreview, (...))
 		if not ok then State.lastError = tostring(err) end
 	end
 	return launch
@@ -10703,14 +10912,16 @@ local function aimStep()
 	fovCircle.Radius = AIM.fov
 	fovCircle.Visible = AIM.enabled and AIM.showFov
 
-	local player, part = currentTarget(wantsHead(heldItemName()))
+	local player, part, root = currentTarget(wantsHead(heldItemName()))
 	if player and player ~= lastLocked then State.locks += 1 end
 	lastLocked = player or lastLocked
 	State.target = player
 
 	local cam = workspace.CurrentCamera
 	if part and cam then
-		local screen = cam:WorldToViewportPoint(part.Position)
+		-- a headshot goes to the server's headshot band, above the visible head
+		local spot = part ~= root and root.Position + Vector3.new(0, HEADSHOT_HEIGHT, 0) or part.Position
+		local screen = cam:WorldToViewportPoint(spot)
 		aimDot.Position = Vector2.new(screen.X, screen.Y)
 		aimDot.Visible = AIM.showMarker and screen.Z > 0
 		fovCircle.Color = FOV_LOCKED
@@ -10999,9 +11210,10 @@ end
 -- pages
 ----------------------------------------------------------------------
 local aimPage, selectAim = makeTab("Aimlock", 1)
-local espPage = makeTab("ESP", 2)
-local keysPage = makeTab("Keybinds", 3)
-local infoPage = makeTab("Info", 4)
+local itemsPage = makeTab("Items", 2)
+local espPage = makeTab("ESP", 3)
+local keysPage = makeTab("Keybinds", 4)
+local infoPage = makeTab("Info", 5)
 
 local aimSwitch -- setter for the Aimlock switch, so its key can flip it too
 local function setAimEnabled(v)
@@ -11021,7 +11233,6 @@ end
 -- Aimlock -------------------------------------------------------------
 section(aimPage, "Lock", 1)
 aimSwitch = toggle(aimPage, 2, "Aimlock", "Every shot and throw curves onto your target", AIM.enabled, setAimEnabled)
-cycler(aimPage, 3, "Aim at", { "Auto", "Head", "Torso" }, AIM.part, function(v) AIM.part = v end)
 cycler(aimPage, 4, "Pick target by", { "Cursor", "Distance" }, AIM.priority, function(v) AIM.priority = v end)
 toggle(aimPage, 5, "Ignore teammates", nil, AIM.teamCheck, function(v) AIM.teamCheck = v end)
 toggle(aimPage, 6, "Wall check", "Only picks up players you can see", AIM.wallCheck, function(v)
@@ -11066,6 +11277,32 @@ local liveInfo = infoBox(aimPage, 20, 106)
 infoBox(aimPage, 21, 72, "Your camera never moves. Bows, crossbows, headhunter, fireballs, snowballs and kit "
 	.. "throwables keep the speed the game gave them and only change direction, so they curve onto the "
 	.. "target. Hold a bow to watch the aim beam bend onto them while you draw.")
+
+-- Items ---------------------------------------------------------------
+local itemInfo = {}
+do
+	local order = 0
+	local function nextOrder()
+		order += 1
+		return order
+	end
+	infoBox(itemsPage, nextOrder(), 58, "Every item has its own settings, learns its own server lead from its own hits and "
+		.. "keeps its own counts, so tuning one never moves another. <b>Full power</b>: every shot leaves at "
+		.. "full-draw speed and damage, however short the draw.")
+	for _, prof in ipairs(ITEMS) do
+		section(itemsPage, prof.label, nextOrder())
+		toggle(itemsPage, nextOrder(), "Aimlock on " .. string.lower(prof.label), nil, prof.enabled, function(v)
+			prof.enabled = v
+		end)
+		cycler(itemsPage, nextOrder(), "Aim at", { "Auto", "Head", "Body" }, prof.aim, function(v) prof.aim = v end)
+		if prof.chargeable then
+			toggle(itemsPage, nextOrder(), "Full power", "Quick taps fly like a full draw", prof.fullPower, function(v)
+				prof.fullPower = v
+			end)
+		end
+		itemInfo[prof.key] = infoBox(itemsPage, nextOrder(), 34)
+	end
+end
 
 -- ESP -----------------------------------------------------------------
 section(espPage, "Players", 1)
@@ -11200,7 +11437,7 @@ if getgenv then
 		hooked = function() return HOOKABLE and Class.calculateImportantLaunchValues == hooked end,
 		pickTarget = pickTarget, currentTarget = currentTarget, hist = hist, pickModel = pickModel,
 		scoreModels = scoreModels, patternAt = patternAt, dampedTau = dampedTau, serverLead = Tune.serverLead,
-		Tune = Tune,
+		Tune = Tune, Vert = Vert, ITEMS = ITEMS, itemProfile = itemProfile,
 		HIST_HZ = HIST_HZ, HIST_LEN = HIST_LEN,
 		lock = function(v) lockHeld = v; if not v then lockedPlayer = nil end end,
 		eggShow = eggShow, easterEgg = easterEgg,
@@ -11300,13 +11537,26 @@ task.spawn(function()
 					and ('%s  <font color="#%s">· covered</font>'):format(held, T.accent:ToHex())
 					or (held .. "  · not a projectile")
 			end
-			local tuned = Tune.shots >= 3 and AIM.autoTune
-				and string.format("tuned %+dms from %d shots", math.floor(Tune.offset * 1000 + 0.5), Tune.shots)
-				or (AIM.autoTune and string.format("learning, %d/3 moving shots", Tune.shots) or "auto-tune off")
+			for key, lbl in pairs(itemInfo) do
+				local s = State.items[key]
+				local track, own = Tune.trackFor(key)
+				lbl.Text = string.format("%s\nLead  %s",
+					s and s.resolved > 0 and string.format("Server hits  %d/%d (%d%%) · %d headshots", s.confirmed, s.resolved,
+						math.floor(100 * s.confirmed / s.resolved + 0.5), s.headshots) or "Server hits  no shots yet",
+					own and string.format("its own, tuned %+dms from %d shots", math.floor(track.offset * 1000 + 0.5), track.shots)
+						or "shared until it has 6 moving shots of its own")
+			end
+
+			-- the lead for whatever is in hand: its own learned lead, or the shared one until it has 3 shots
+			local heldProf = itemProfile(held, nil)
+			local track, own = Tune.trackFor(heldProf.key)
+			local tuned = track.shots >= 3 and AIM.autoTune
+				and string.format("%s tuned %+dms from %d shots", own and heldProf.label or "shared", math.floor(track.offset * 1000 + 0.5), track.shots)
+				or (AIM.autoTune and string.format("learning, %d/3 moving shots", track.shots) or "auto-tune off")
 			liveInfo.Text = string.format(
 				"Holding      %s\nLast shot    %s\nAimed with   %s\nServer lead  %dms · ping %dms · %s\nServer hits  %s\nShots        %d locked · %d out of reach",
 				covered or "nothing", State.lastShot or "—", State.lastModel or "—",
-				math.floor(Tune.serverLead() * 1000 + 0.5), math.floor(Tune.ping * 1000 + 0.5), tuned,
+				math.floor(Tune.serverLead(heldProf.key) * 1000 + 0.5), math.floor(Tune.ping * 1000 + 0.5), tuned,
 				State.resolved > 0 and string.format("%d/%d (%d%%) · %d headshots", State.confirmed, State.resolved,
 					math.floor(100 * State.confirmed / State.resolved + 0.5), State.headshots) or "—",
 				State.shots, State.outOfReach
