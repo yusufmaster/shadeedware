@@ -8773,7 +8773,7 @@ end)
 --!nocheck
 --[[
 	SHADEEDWARE — BedWars
-	Projectile Aimlock · FOV circle · Lock keys · ESP
+	Projectile Aimlock · Rapid fire · Autoclicker · FOV circle · Lock keys · ESP
 
 	Read out of the live BedWars client (Game Mega, place version 4150):
 	  launch   -> every item projectile -- bows, crossbows, headhunter, fireballs, snowballs, kit
@@ -9055,13 +9055,14 @@ local KEYS = {
 --   aim        "Auto" = headshots for items that score them, body otherwise | "Head" | "Body"
 --   fullPower  a half-drawn shot leaves at full-draw speed and damage. The server takes it: quick-tap
 --              bow shots went 4 of 5 with it and 0 of 6 without (99 sps arrows, 1.6s flights).
+--   rapid      fires in bursts of 3 as fast as the server pays for them (see Rapid)
 local ITEMS = {
-	{ key = "Headhunter", label = "Headhunter", match = { "headhunter" }, enabled = true, aim = "Auto", headshots = true },
-	{ key = "Crossbow", label = "Crossbow", match = { "crossbow" }, enabled = true, aim = "Body" },
-	{ key = "Bow", label = "Bow", match = { "bow" }, enabled = true, aim = "Body", fullPower = true, chargeable = true },
-	{ key = "Fireball", label = "Fireball", match = { "fireball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true },
-	{ key = "Snowball", label = "Snowballs", match = { "snowball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true },
-	{ key = "Other", label = "Everything else", match = {}, enabled = true, aim = "Body" },
+	{ key = "Headhunter", label = "Headhunter", match = { "headhunter" }, enabled = true, aim = "Head", headshots = true, rapid = true },
+	{ key = "Crossbow", label = "Crossbow", match = { "crossbow" }, enabled = true, aim = "Body", rapid = true },
+	{ key = "Bow", label = "Bow", match = { "bow" }, enabled = true, aim = "Body", fullPower = true, chargeable = true, rapid = true },
+	{ key = "Fireball", label = "Fireball", match = { "fireball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true, rapid = false },
+	{ key = "Snowball", label = "Snowballs", match = { "snowball" }, enabled = true, aim = "Body", fullPower = false, chargeable = true, rapid = false },
+	{ key = "Other", label = "Everything else", match = {}, enabled = true, aim = "Body", rapid = false },
 }
 
 local function itemProfile(itemName, projectile)
@@ -10894,17 +10895,339 @@ local function redirect(handler, launch, isPreview, tool)
 	end
 end
 
+----------------------------------------------------------------------
+-- rapid fire
+----------------------------------------------------------------------
+-- Items with rapid on fire in bursts: Rapid.burstSize shots Rapid.fireDelay apart, then nothing until
+-- the server will pay for the next burst. Holding the attack button keeps it going.
+-- Measured 2026-09-22 against server damage in a private match, with Vanessa (the triple-shot kit):
+-- the server takes shots sooner than fireDelaySec, but prices the early ones like a triple shot's
+-- arrows -- first full, the next 16/9 of full, the third a third (bow 18/32/6, headhunter headshots
+-- 82.5/147/27) -- then drops everything (ghost shots, no damage) until the item has rested. A shot
+-- that misses still counts. Bursts starting fireDelaySec + Rapid.burstRest apart paid 18/32/6 every
+-- time (bow 0.95s, headhunter 1.6s); 0.85s apart the next ones paid 18/6/6. Plain spam every 0.2s
+-- ran 18, 32, 6, ghost, ghost -- the same damage, with two arrows wasted per burst.
+local Rapid = {
+	auto = true, -- holding the attack button keeps firing at that pace
+	fireDelay = 0.1, -- the gap between shots inside a burst (Vanessa's triple shot fires 0.1s apart)
+	burstSize = 3,
+	burstRest = 0.35, -- a burst starts this long past the item's fireDelaySec after the last one did
+	bursts = {}, -- per item type: { start = os.clock() of its first shot, count = shots so far }
+	triple = false, -- Vanessa: every shot is a triple shot, without the charge-up
+	ours = setmetatable({}, { __mode = "k" }), -- handlers of shots auto-fire made itself
+	-- The full draw each of our full-draw shots sends. The game's charge loop starts deferred, so on
+	-- a draw we start and release in one frame it runs after the release and zeroes the handler's
+	-- draw -- and the triple shot's later arrows launch off that handler. The server paid them 16
+	-- and 3 instead of 32 and 6.
+	draw = setmetatable({}, { __mode = "k" }),
+	launches = setmetatable({}, { __mode = "k" }), -- launches per handler: more than one is a multishot
+	armed = false, -- this attack press started a draw of the game's own, so holding it may keep firing
+	shots = 0, -- shots that got the short cooldown
+}
+do
+	local knit, cooldowns, cooldownConn, sources
+	pcall(function()
+		knit = require(ReplicatedStorage.rbxts_include.node_modules["@easy-games"].knit.src).KnitClient
+	end)
+	pcall(function()
+		local Flamework = require(ReplicatedStorage.rbxts_include.node_modules["@flamework"].core.out).Flamework
+		cooldowns = Flamework.resolveDependency("@easy-games/game-core:client/controllers/cooldown/cooldown-controller@CooldownController")
+	end)
+	local function yes() return true end
+	local function zero() return 0 end
+
+	local function tripleSource()
+		local ts = knit and knit.Controllers and knit.Controllers.TripleShotProjectileController
+		return type(ts) == "table" and ts or nil
+	end
+
+	-- Vanessa's triple shot fires its extra arrows when getChargeTime() has passed since the full
+	-- draw; with it at 0 every release fires all three. Put back by setting it false (unload does).
+	function Rapid.setTriple(v)
+		Rapid.triple = v
+		local ts = tripleSource()
+		if ts then ts.getChargeTime = (v and State.running) and zero or nil end
+	end
+
+	-- The game asks ProjectileCooldownModifierCheck for the cooldown straight after launching a shot,
+	-- so the launch hook leaves the cooldown that shot should get here for it.
+	local pendingCooldown, pendingAt = nil, 0
+	local function setCooldown(seconds)
+		pendingCooldown, pendingAt = seconds, os.clock()
+	end
+	-- On a thread of its own: connecting to the game's sync event leaves the connecting thread unable
+	-- to parent instances ("lacking capability Plugin"), which stranded the load on the splash.
+	task.spawn(pcall, function()
+		local syncEvents = require(LocalPlayer.PlayerScripts.TS["client-sync-events"]).ClientSyncEvents
+		cooldownConn = syncEvents.ProjectileCooldownModifierCheck:connect(function(ev)
+			if pendingCooldown and State.running and os.clock() - pendingAt < 0.05 and type(ev.cooldown) == "number" then
+				ev.cooldown = pendingCooldown
+			end
+			pendingCooldown = nil
+		end)
+		Rapid.cooldownHooked = cooldownConn ~= nil
+	end)
+
+	function Rapid.stop()
+		Rapid.setTriple(false)
+		if cooldownConn then pcall(function() cooldownConn:Destroy() end) end
+	end
+
+	-- the projectile-source controller behind what's in hand: bows, crossbows, the headhunter, the
+	-- triple-shot bow, kit launchers
+	local function activeSource()
+		if not sources then
+			if not (knit and knit.Controllers) then return nil end
+			sources = {}
+			for _, c in pairs(knit.Controllers) do
+				if type(c) == "table" and type(c.beginHolding) == "function" and type(c.releaseChargeInput) == "function" then
+					sources[#sources + 1] = c
+				end
+			end
+		end
+		for _, c in ipairs(sources) do
+			if c.projectileHandler or (type(c.isEnabled) == "function" and c:isEnabled()) then return c end
+		end
+		return nil
+	end
+
+	-- Lets a draw go through the game's own release. fullDraw sends it at a full draw's speed and
+	-- drawDurationSeconds however short it was, which the server takes (see fullPower).
+	local function release(src, hand, handler, fullDraw)
+		local ps = src:getProjectileSource(hand)
+		if fullDraw and ps and ps.maxStrengthChargeSec then
+			handler.drawDurationSeconds = math.max(handler.drawDurationSeconds or 0, ps.maxStrengthChargeSec)
+			handler.velocityMultiplier = 1
+			Rapid.draw[handler] = handler.drawDurationSeconds
+		end
+		src:releaseChargeInput(src.aimingMaid, yes, nil)
+	end
+
+	-- a draw of our own, let go in the same frame
+	local function shoot(src, hand, fullDraw)
+		if not src:beginHolding(hand, nil, src.aimingMaid, false) then return false end
+		local handler = src.projectileHandler
+		if not handler then return false end
+		Rapid.ours[handler] = true
+		release(src, hand, handler, fullDraw)
+		return true
+	end
+
+	-- every real launch, from the launch hook
+	function Rapid.onShot(handler, tool)
+		Rapid.launches[handler] = (Rapid.launches[handler] or 0) + 1
+		-- the second and third arrows of a triple shot
+		if Rapid.launches[handler] > 1 then return end
+		local src, projectile = handler.projectileSourceController, handler.projectile
+		if type(src) ~= "table" or type(projectile) ~= "string" or projectile == "telepearl" then return end
+		local itemName = typeof(tool) == "Instance" and tool.Name or nil
+		if not (itemProfile(itemName, projectile).rapid or (Rapid.triple and src == tripleSource())) then return end
+		local hand = src:getHandItem()
+		local itemType = hand and hand.itemType or itemName or projectile
+		local meta = ItemMeta and ItemMeta[itemType]
+		local ps = meta and meta.projectileSource
+		local fireDelaySec = ps and ps.fireDelaySec or 0.6
+		local cycle = fireDelaySec + Rapid.burstRest
+		local now = os.clock()
+		local burst = Rapid.bursts[itemType]
+		if not burst or now - burst.start >= cycle - 0.03 then
+			burst = { start = now, count = 0 }
+			Rapid.bursts[itemType] = burst
+		end
+		-- A triple shot is a whole burst by itself; its onLaunch has already decided, by the same test
+		-- as this, before it launched the first arrow.
+		local volley = false
+		if src == tripleSource() then
+			local ok, chargeTime = pcall(src.getChargeTime, src)
+			local since = src.overchargeStartTime
+			volley = ok and (chargeTime == 0 or (type(since) == "number" and since ~= 0 and chargeTime <= tick() - since))
+		end
+		burst.count += volley and Rapid.burstSize or 1
+		if burst.count >= Rapid.burstSize then
+			-- anything sooner than the next burst would be a ghost shot
+			setCooldown(math.max(burst.start + cycle - now, 0.05))
+		else
+			setCooldown(math.min(Rapid.fireDelay, fireDelaySec))
+		end
+		Rapid.shots += 1
+	end
+
+	-- every frame: while the attack button is down, fire as soon as the game's cooldown lets it
+	function Rapid.step()
+		if not (State.running and Rapid.auto) then return end
+		if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			Rapid.armed = false
+			return
+		end
+		local src = activeSource()
+		local hand = src and src:getHandItem()
+		if not hand or hand.itemType == "telepearl" then return end
+		local prof = itemProfile(hand.itemType, nil)
+		if not (prof.rapid or (Rapid.triple and src == tripleSource())) then return end
+		local handler = src.projectileHandler
+		if handler then
+			if Rapid.ours[handler] then return end
+			-- the game's own draw for this press: let it go now, or once it's fully drawn without full power
+			Rapid.armed = true
+			local ps = src:getProjectileSource(hand)
+			local full = ps and ps.maxStrengthChargeSec
+			if full and not prof.fullPower and (handler.drawDurationSeconds or 0) < full then return end
+			release(src, hand, handler, prof.fullPower)
+			return
+		end
+		-- a click that never reached the game (a menu, the hub) doesn't start firing
+		if not (Rapid.armed and cooldowns) then return end
+		local ps = src:getProjectileSource(hand)
+		if not ps or cooldowns:isOnCooldown(src:getCooldownId(ps, hand.itemType)) then return end
+		shoot(src, hand, prof.fullPower)
+	end
+
+	Rapid.setTriple(Rapid.triple)
+end
+
 local function hooked(self, handler, isPreview, ...)
 	local launch = original(self, handler, isPreview, ...)
 	-- State.running guards a copy that outlived its unload (something else hooked on top of it)
-	if State.running and AIM.enabled and launch and handler then
+	if State.running and launch and handler then
 		-- the launcher's tool comes through as the first extra argument (item launches and the aim beam)
-		local ok, err = pcall(redirect, handler, launch, isPreview, (...))
-		if not ok then State.lastError = tostring(err) end
+		local tool = (...)
+		local draw = Rapid.draw[handler]
+		if draw then launch.drawDurationSeconds = math.max(launch.drawDurationSeconds or 0, draw) end
+		if AIM.enabled then
+			local ok, err = pcall(redirect, handler, launch, isPreview, tool)
+			if not ok then State.lastError = tostring(err) end
+		end
+		if not isPreview then
+			local ok, err = pcall(Rapid.onShot, handler, tool)
+			if not ok then State.lastError = tostring(err) end
+		end
 	end
 	return launch
 end
 if HOOKABLE then Class.calculateImportantLaunchValues = hooked end
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(Rapid.step)
+	if not ok then State.lastError = tostring(err) end
+end)
+
+----------------------------------------------------------------------
+-- autoclicker
+----------------------------------------------------------------------
+-- Holding the attack button with a sword or blocks repeats the game's own click: the sword swing
+-- (SwordController:swingSwordAtMouse, what a click and the gamepad's hold-to-swing call) and the
+-- block placement at the mouse (the placer's MouseButton1 action, one block per press). Swords stay
+-- inside the game's limits either way: it drops swings under 1/9s apart (isClickingTooFast) and
+-- holds hits to the sword's attackSpeed (0.3s for most), buffering the ones that come early.
+local Clicker = {
+	enabled = true,
+	swords = true,
+	blocks = true,
+	cps = 20,
+	armed = false, -- the press went to the world, not to the hub or a menu button
+	last = 0,
+}
+do
+	local knit, placeMode
+	pcall(function()
+		knit = require(ReplicatedStorage.rbxts_include.node_modules["@easy-games"].knit.src).KnitClient
+	end)
+	pcall(function()
+		local engine = ReplicatedStorage.rbxts_include.node_modules["@easy-games"]["block-engine"].out
+		placeMode = require(engine.client.select["block-selector"]).BlockSelectorMode.PLACE
+	end)
+
+	-- BedWars' HUD frames mark every world click as processed, so gameProcessed can't tell a world
+	-- click from a menu click. A button under the mouse, or the hub's own window, can.
+	function Clicker.onWorld(input)
+		if win.Visible then
+			local mouse = UserInputService:GetMouseLocation()
+			local p, s = win.AbsolutePosition, win.AbsoluteSize
+			if mouse.X >= p.X and mouse.X <= p.X + s.X and mouse.Y >= p.Y and mouse.Y <= p.Y + s.Y then return false end
+		end
+		for _, g in ipairs(PlayerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)) do
+			if g.Visible and (g:IsA("GuiButton") or g:IsA("TextBox")) then return false end
+		end
+		return true
+	end
+
+	function Clicker.step()
+		if not (State.running and Clicker.enabled and Clicker.armed and knit) then return end
+		if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			Clicker.armed = false
+			return
+		end
+		local now = os.clock()
+		if now - Clicker.last < 1 / Clicker.cps then return end
+		local item = heldItemName()
+		local meta = item and ItemMeta and ItemMeta[item]
+		if not meta then return end
+		if meta.sword and not meta.sword.chargedAttack then
+			local swords = knit.Controllers.SwordController
+			-- in step with the game's own 1/9s limit, or clicks that land just inside it are wasted
+			-- (a steady 20 a second only got 7 swings through)
+			if Clicker.swords and swords and not swords.disableSwingState and tick() - (swords.lastSwing or 0) >= 1 / 9 then
+				Clicker.last = now
+				swords:swingSwordAtMouse()
+			end
+		elseif meta.block and Clicker.blocks and placeMode ~= nil then
+			local placer = knit.Controllers.BlockPlacementController:getBlockPlacer()
+			local info = placer and placer.clientManager:getBlockSelector():getMouseInfo(placeMode)
+			if info then
+				Clicker.last = now
+				-- placeBlock waits on the server's answer; the next click shouldn't
+				task.spawn(placer.placeBlock, placer, info.placementPosition, info)
+			end
+		end
+	end
+end
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(Clicker.step)
+	if not ok then State.lastError = tostring(err) end
+end)
+
+----------------------------------------------------------------------
+-- fast pickaxe
+----------------------------------------------------------------------
+-- Holding the attack button with a pickaxe hits the block once per BlockBreaker.cooldown, 0.3s for
+-- every pickaxe (they differ only in damage per hit). Measured 2026-09-22 on a 75-health stone brick
+-- with a wood pickaxe: hits 0.264s apart all counted (broken in 3.96s against 4.70s normally),
+-- 0.233s apart only every other one did (6.75s), and 40 hits 0.1s apart never broke it -- the
+-- server skips a hit that comes too soon after the last one it counted. So the cooldown is scaled
+-- to the 0.264s that worked (at a high frame rate the game's wait lands right on what it's given).
+local FastBreak = { enabled = true, scale = 0.88 }
+do
+	local breaker, raw
+	local function get()
+		if breaker then return breaker end
+		pcall(function()
+			local knit = require(ReplicatedStorage.rbxts_include.node_modules["@easy-games"].knit.src).KnitClient
+			local controller = knit.Controllers.BlockBreakController
+			breaker = controller and controller.blockBreaker
+		end)
+		if breaker then
+			raw = breaker.cooldown
+			-- the game sets it on every equip, and Efficiency lowers it; scale whatever it sets
+			breaker.setCooldown = function(self, v)
+				raw = v
+				self.cooldown = (FastBreak.enabled and State.running) and v * FastBreak.scale or v
+			end
+		end
+		return breaker
+	end
+	function FastBreak.refresh()
+		local b = get()
+		if b and type(raw) == "number" then
+			b.cooldown = (FastBreak.enabled and State.running) and raw * FastBreak.scale or raw
+		end
+	end
+	function FastBreak.stop()
+		if breaker then
+			breaker.setCooldown = nil
+			if type(raw) == "number" then breaker.cooldown = raw end
+		end
+	end
+	FastBreak.refresh()
+end
 
 local function aimStep()
 	local cursor = UserInputService:GetMouseLocation()
@@ -11005,7 +11328,9 @@ do
 		e.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 		e.hl.OutlineTransparency = 0
 		e.hl.Enabled = false
-		e.hl.Parent = espFolder
+		-- Some servers refuse it here ("lacking capability Plugin", seen in Game Micro), which killed
+		-- the whole load on the splash; there the chams stay off and the rest of the ESP still draws.
+		pcall(function() e.hl.Parent = espFolder end)
 		return e
 	end
 
@@ -11207,6 +11532,105 @@ do
 end
 
 ----------------------------------------------------------------------
+-- saved settings
+----------------------------------------------------------------------
+-- What the menu sets goes to a file in the executor's workspace and comes back on the next run,
+-- loaded before the menu is built so every switch shows it. Only the settings the menu shows are
+-- saved, each by name, and a saved value only replaces a default of the same kind.
+local Settings = {
+	file = "shadeedware_bedwars_settings.json",
+	dim = 0.82, -- Info > Appearance > Background dim
+}
+do
+	local HttpService = game:GetService("HttpService")
+	local rf, wf = glob("readfile"), glob("writefile")
+	local FIELDS = {
+		AIM = { AIM, { "enabled", "mode", "priority", "fov", "showFov", "showMarker", "teamCheck", "wallCheck", "lead",
+			"skipPearls", "maxDistance", "model", "autoTune" } },
+		ESP = { ESP, { "enabled", "chams", "boxes", "skeleton", "names", "distance", "heldItem", "healthBars", "tracers",
+			"tracerOrigin", "colorMode", "teamCheck", "maxDistance", "chamsFill", "textSize" } },
+		KEYS = { KEYS, { "menu", "aimToggle", "lock", "esp" } },
+		Rapid = { Rapid, { "auto", "fireDelay", "triple" } },
+		Clicker = { Clicker, { "enabled", "swords", "blocks", "cps" } },
+		FastBreak = { FastBreak, { "enabled" } },
+		UI = { Settings, { "dim" } },
+	}
+	local ITEM_FIELDS = { "enabled", "aim", "fullPower", "rapid" }
+
+	local function encode(v)
+		if typeof(v) == "EnumItem" then return tostring(v) end -- "Enum.KeyCode.X"
+		return v
+	end
+	local function decode(saved, current)
+		if typeof(current) == "EnumItem" then
+			if type(saved) ~= "string" then return nil end
+			local kind, name = saved:match("^Enum%.(%w+)%.(%w+)$")
+			local ok, item = pcall(function() return Enum[kind][name] end)
+			return ok and item or nil
+		end
+		return type(saved) == type(current) and saved or nil
+	end
+
+	local function snapshot()
+		local out = { items = {} }
+		for group, spec in pairs(FIELDS) do
+			local t = {}
+			for _, k in ipairs(spec[2]) do t[k] = encode(spec[1][k]) end
+			out[group] = t
+		end
+		for _, prof in ipairs(ITEMS) do
+			local t = {}
+			for _, k in ipairs(ITEM_FIELDS) do t[k] = prof[k] end
+			out.items[prof.key] = t
+		end
+		return out
+	end
+
+	local last
+	function Settings.load()
+		local ok, data = pcall(function() return HttpService:JSONDecode(rf(Settings.file)) end)
+		if ok and type(data) == "table" then
+			for group, spec in pairs(FIELDS) do
+				local saved = data[group]
+				if type(saved) == "table" then
+					for _, k in ipairs(spec[2]) do
+						local v = decode(saved[k], spec[1][k])
+						if v ~= nil then spec[1][k] = v end
+					end
+				end
+			end
+			for _, prof in ipairs(ITEMS) do
+				local saved = type(data.items) == "table" and data.items[prof.key]
+				if type(saved) == "table" then
+					for _, k in ipairs(ITEM_FIELDS) do
+						local v = decode(saved[k], prof[k])
+						if v ~= nil then prof[k] = v end
+					end
+				end
+			end
+		end
+		last = HttpService:JSONEncode(snapshot())
+	end
+
+	-- writes only when something changed since the last save
+	function Settings.save()
+		if not wf then return end
+		local json = HttpService:JSONEncode(snapshot())
+		if json == last then return end
+		if pcall(wf, Settings.file, json) then last = json end
+	end
+end
+pcall(Settings.load)
+pcall(Rapid.setTriple, Rapid.triple)
+pcall(FastBreak.refresh)
+task.spawn(function()
+	while State.running do
+		task.wait(1)
+		pcall(Settings.save)
+	end
+end)
+
+----------------------------------------------------------------------
 -- pages
 ----------------------------------------------------------------------
 local aimPage, selectAim = makeTab("Aimlock", 1)
@@ -11289,6 +11713,30 @@ do
 	infoBox(itemsPage, nextOrder(), 58, "Every item has its own settings, learns its own server lead from its own hits and "
 		.. "keeps its own counts, so tuning one never moves another. <b>Full power</b>: every shot leaves at "
 		.. "full-draw speed and damage, however short the draw.")
+	section(itemsPage, "Autoclicker", nextOrder())
+	toggle(itemsPage, nextOrder(), "Autoclicker", "Hold the attack button to keep clicking", Clicker.enabled, function(v)
+		Clicker.enabled = v
+	end)
+	toggle(itemsPage, nextOrder(), "Swords", nil, Clicker.swords, function(v) Clicker.swords = v end)
+	toggle(itemsPage, nextOrder(), "Blocks", "Bridging and towering", Clicker.blocks, function(v) Clicker.blocks = v end)
+	slider(itemsPage, nextOrder(), "Clicks per second", 5, 30, Clicker.cps, "", function(v) Clicker.cps = math.floor(v + 0.5) end)
+	infoBox(itemsPage, nextOrder(), 46, "Swords stay within the game's own limits: 9 swings a second, and a hit "
+		.. "every 0.3s on most swords however fast you click.")
+	toggle(itemsPage, nextOrder(), "Fast pickaxe", "Hits ~12% faster, the most the server still counts", FastBreak.enabled, function(v)
+		FastBreak.enabled = v
+		FastBreak.refresh()
+	end)
+	section(itemsPage, "Rapid fire", nextOrder())
+	toggle(itemsPage, nextOrder(), "Hold to auto-fire", "Keeps shooting while the attack button is down", Rapid.auto, function(v)
+		Rapid.auto = v
+	end)
+	slider(itemsPage, nextOrder(), "Burst spacing", 0.05, 0.5, Rapid.fireDelay, " s", function(v) Rapid.fireDelay = v end)
+	toggle(itemsPage, nextOrder(), "Instant triple shot", "Vanessa: all three arrows on every shot, no charge-up",
+		Rapid.triple, Rapid.setTriple)
+	infoBox(itemsPage, nextOrder(), 84, "Items with <b>Rapid fire</b> on shoot in bursts of 3, <b>Burst spacing</b> "
+		.. "apart. The server only pays for 3 quick shots and turns the rest into ghost shots until the item has "
+		.. "rested, so the next burst waits for that: bow 18 + 32 + 6 every 0.95s (~59 a second against 30 "
+		.. "normally), headhunter every 1.6s.")
 	for _, prof in ipairs(ITEMS) do
 		section(itemsPage, prof.label, nextOrder())
 		toggle(itemsPage, nextOrder(), "Aimlock on " .. string.lower(prof.label), nil, prof.enabled, function(v)
@@ -11300,6 +11748,9 @@ do
 				prof.fullPower = v
 			end)
 		end
+		toggle(itemsPage, nextOrder(), "Rapid fire", "Bursts of 3 instead of one shot per cooldown", prof.rapid, function(v)
+			prof.rapid = v
+		end)
 		itemInfo[prof.key] = infoBox(itemsPage, nextOrder(), 34)
 	end
 end
@@ -11395,10 +11846,12 @@ do
 end
 
 section(infoPage, "Appearance", 7)
-slider(infoPage, 8, "Background dim", 0, 1, 0.82, "", function(v)
+slider(infoPage, 8, "Background dim", 0, 1, Settings.dim, "", function(v)
+	Settings.dim = v
 	winScrim.BackgroundTransparency = 1 - v
 	splashBg.ImageTransparency = 0.45 * v
 end)
+winScrim.BackgroundTransparency = 1 - Settings.dim
 
 selectAim()
 
@@ -11407,13 +11860,16 @@ selectAim()
 ----------------------------------------------------------------------
 local function unload()
 	if not State.running then return end
+	pcall(Settings.save)
 	State.running = false
+	pcall(FastBreak.stop)
 	if HOOKABLE and Class.calculateImportantLaunchValues == hooked then
 		Class.calculateImportantLaunchValues = original
 	end
 	pcall(RunService.UnbindFromRenderStep, RunService, AIM_BIND)
 	pcall(RunService.UnbindFromRenderStep, RunService, ESP_BIND)
 	if Tune.disconnect then pcall(Tune.disconnect) end
+	pcall(Rapid.stop)
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for player in pairs(espEntries) do removePlayer(player) end
 	pcall(function() fovCircle:Remove() end)
@@ -11437,7 +11893,8 @@ if getgenv then
 		hooked = function() return HOOKABLE and Class.calculateImportantLaunchValues == hooked end,
 		pickTarget = pickTarget, currentTarget = currentTarget, hist = hist, pickModel = pickModel,
 		scoreModels = scoreModels, patternAt = patternAt, dampedTau = dampedTau, serverLead = Tune.serverLead,
-		Tune = Tune, Vert = Vert, ITEMS = ITEMS, itemProfile = itemProfile,
+		Tune = Tune, Vert = Vert, ITEMS = ITEMS, itemProfile = itemProfile, Rapid = Rapid, Clicker = Clicker,
+		FastBreak = FastBreak, Settings = Settings,
 		HIST_HZ = HIST_HZ, HIST_LEN = HIST_LEN,
 		lock = function(v) lockHeld = v; if not v then lockedPlayer = nil end end,
 		eggShow = eggShow, easterEgg = easterEgg,
@@ -11478,6 +11935,12 @@ do
 end
 
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
+	-- every new press has to start a draw of the game's own before holding it auto-fires
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		Rapid.armed = false
+		local ok, world = pcall(Clicker.onWorld, i)
+		Clicker.armed = ok and world
+	end
 	if keyCapture then return end
 	-- Typing in chat never fires a bind. Clicks always count: BedWars' HUD frames would swallow them.
 	if gp and i.UserInputType == Enum.UserInputType.Keyboard then return end
@@ -11500,6 +11963,7 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
 	end
 end)
 conns[#conns + 1] = UserInputService.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then Rapid.armed, Clicker.armed = false, false end
 	if AIM.mode == "Hold" and matchesKey(i, KEYS.lock) then
 		lockHeld, lockedPlayer = false, nil
 	end
@@ -11554,12 +12018,12 @@ task.spawn(function()
 				and string.format("%s tuned %+dms from %d shots", own and heldProf.label or "shared", math.floor(track.offset * 1000 + 0.5), track.shots)
 				or (AIM.autoTune and string.format("learning, %d/3 moving shots", track.shots) or "auto-tune off")
 			liveInfo.Text = string.format(
-				"Holding      %s\nLast shot    %s\nAimed with   %s\nServer lead  %dms · ping %dms · %s\nServer hits  %s\nShots        %d locked · %d out of reach",
+				"Holding      %s\nLast shot    %s\nAimed with   %s\nServer lead  %dms · ping %dms · %s\nServer hits  %s\nShots        %d locked · %d out of reach · %d rapid",
 				covered or "nothing", State.lastShot or "—", State.lastModel or "—",
 				math.floor(Tune.serverLead(heldProf.key) * 1000 + 0.5), math.floor(Tune.ping * 1000 + 0.5), tuned,
 				State.resolved > 0 and string.format("%d/%d (%d%%) · %d headshots", State.confirmed, State.resolved,
 					math.floor(100 * State.confirmed / State.resolved + 0.5), State.headshots) or "—",
-				State.shots, State.outOfReach
+				State.shots, State.outOfReach, Rapid.shots
 			)
 
 			controlsLbl.Text = string.format(
