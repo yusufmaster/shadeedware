@@ -12524,7 +12524,6 @@ local AR = {
 	enabled = false,
 	mode = "After I lose it", -- "After I lose it" | "Any loose ball"
 	range = 60, -- studs: how far away a loose ball is still worth chasing
-	boost = 0, -- studs/s added to your walk speed while chasing (ramped in, capped at +5); off by default
 }
 
 -- Rebound path: predicts where the court's ball goes and shows it
@@ -13514,7 +13513,7 @@ local ACTOR_CODE = [==[
 
 	local cfg = { on = true, mode = "Max", value = 1, spread = 0.003, blockOn = false, blockDelay = 0.2, blockRange = 15,
 		ankleOn = false, ankleMove = "Mix", ankleRange = 18, ankleGap = 0.9, ankleGuard = true, ankleTrigger = "On steal",
-		recoverOn = false, recoverMode = "After I lose it", recoverRange = 60, recoverBoost = 0, recoverPredict = false }
+		recoverOn = false, recoverMode = "After I lose it", recoverRange = 60, recoverPredict = false }
 	local rng = Random.new()
 	local origGCP, origMsg = shooting.GetCurrentPoint, info.Message
 
@@ -13541,13 +13540,13 @@ local ACTOR_CODE = [==[
 		return origMsg(self, timing, contest, perfect, ...)
 	end
 
-	local conn = ch.Event:Connect(function(tag, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, q, r, u)
+	local conn = ch.Event:Connect(function(tag, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, q, r)
 		if tag == "cfg" then
 			cfg.on, cfg.mode, cfg.value, cfg.spread = a, b, c, d
 			cfg.blockOn, cfg.blockDelay, cfg.blockRange = e, f, g
 			cfg.ankleOn, cfg.ankleMove, cfg.ankleRange, cfg.ankleGap, cfg.ankleGuard, cfg.ankleTrigger = h, i, j, k, l, m
 			cfg.recoverOn, cfg.recoverMode, cfg.recoverRange = n, o, q
-			cfg.recoverBoost, cfg.recoverPredict = r, u
+			cfg.recoverPredict = r
 		elseif tag == "target" then
 			cfg.target, cfg.targetAt = a, os.clock()
 		end
@@ -13749,22 +13748,7 @@ local ACTOR_CODE = [==[
 	end
 	if me.Character then hookCharacter(me.Character) end
 	table.insert(ankleConns, me.CharacterAdded:Connect(hookCharacter))
-	-- Chasing runs a little over the game's own walk speed: ramped in over 0.4s, wandering a few
-	-- tenths, never more than +5 (its dribble moves already peak at 18-22 against a 17 walk).
-	local PlayerController = Knit.GetController("PlayerController")
-	local boosted = false
-	local chaseStart = 0
-	local function baseSpeed()
-		local ok, v = pcall(PlayerController.ResolveSpeedAndJump, PlayerController)
-		return ok and v or 0
-	end
-	local function unboost()
-		if not boosted then return end
-		boosted = false
-		local hum = me.Character and me.Character:FindFirstChildOfClass("Humanoid")
-		local v = baseSpeed()
-		if hum and v > 0 then hum.WalkSpeed = v end
-	end
+	-- Chasing walks at the game's own speed: it only steers the character with Humanoid:MoveTo.
 	task.spawn(function()
 		while alive do
 			task.wait(0.05)
@@ -13772,7 +13756,7 @@ local ACTOR_CODE = [==[
 				local char = me.Character
 				local hum = char and char:FindFirstChildOfClass("Humanoid")
 				local mine = char and char:FindFirstChild("HumanoidRootPart")
-				local function stop() chasing = false unboost() end
+				local function stop() chasing = false end
 				if not (cfg.recoverOn and hum and mine) or char:FindFirstChild("Basketball") then return stop() end
 				if cfg.recoverMode == "After I lose it" and os.clock() - lostAt > 5 then return stop() end
 				local b = looseBall()
@@ -13781,30 +13765,20 @@ local ACTOR_CODE = [==[
 				if d > cfg.recoverRange then return stop() end
 				if not chasing then
 					chasing = true
-					chaseStart = os.clock()
 					ch:Fire("chase", d)
 				end
 				local dest = b.Position
 				local predicted = cfg.recoverPredict and cfg.target and os.clock() - (cfg.targetAt or 0) < 0.3
 				if predicted then dest = cfg.target end
 				hum:MoveTo(Vector3.new(dest.X, mine.Position.Y, dest.Z))
-				local base = baseSpeed()
-				if cfg.recoverBoost > 0 and base > 0 and hum.WalkSpeed > 0 then
-					local ramp = math.clamp((os.clock() - chaseStart) / 0.4, 0, 1)
-					local wander = math.sin(os.clock() * 3.1) * 0.3 * ramp
-					hum.WalkSpeed = base + math.min(cfg.recoverBoost, 5) * ramp + wander
-					boosted = true
-				end
 			end)
 		end
-		unboost()
 	end)
 
 	env.__MP_AP = {
 		restore = function()
 			conn:Disconnect()
 			alive = false
-			pcall(unboost)
 			for _, c in ipairs(ankleConns) do pcall(function() c:Disconnect() end) end
 			if blockConn then blockConn:Disconnect() end
 			if Jump and origBlock and Jump.Block ~= origBlock then Jump.Block = origBlock end
@@ -13821,7 +13795,7 @@ local function pushConfig()
 	if apChannelEvent then
 		apChannelEvent:Fire("cfg", AP.enabled, AP.mode, AP.value, AP.spread, AB.enabled, AB.delay, AB.range,
 			AK.enabled, AK.move, AK.range, AK.gap, AK.guardOnly, AK.trigger,
-			AR.enabled, AR.mode, AR.range, AR.boost, RB.enabled and RB.walkToSpot)
+			AR.enabled, AR.mode, AR.range, RB.enabled and RB.walkToSpot)
 	end
 end
 
@@ -14197,19 +14171,11 @@ slider(handlesPage, 14, "Max distance", 10, 120, AR.range, " studs", function(v)
 	AR.range = math.floor(v + 0.5)
 	pushConfig()
 end)
-slider(handlesPage, 17, "Chase speed boost", 0, 5, AR.boost, " studs/s", function(v)
-	AR.boost = math.floor(v * 2 + 0.5) / 2
-	pushConfig()
-end)
 infoBox(handlesPage, 15, 88, "The moment you lose the ball and it ends up loose (not on a shot), you walk "
 	.. "straight at it and keep following it while it bounces, until you have it or someone else does. "
 	.. "After I lose it only chases for 5 seconds after you lose the ball; Any loose ball also chases "
 	.. "rebounds and anything else on the floor.")
 local recoverBox = infoBox(handlesPage, 16, 40)
-infoBox(handlesPage, 18, 74, "The boost adds to your walk speed only while you chase: it eases in over "
-	.. "about half a second, drifts a few tenths so it isn't a flat number, and never goes past +5. "
-	.. "The game's own dribble moves already run at 18 to 22 against a 17 walk, but the server can see your walk speed. "
-	.. "Off by default; a banned account is a bigger cost than a slower chase.")
 
 section(reboundPage, "Rebound path", 1)
 toggle(reboundPage, 2, "Rebound path", "Tracks the court's ball in the air and works out where it comes down", RB.enabled, function(v)
