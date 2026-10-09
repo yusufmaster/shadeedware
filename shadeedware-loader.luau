@@ -9003,7 +9003,18 @@ local State = {
 	espErrors = 0, -- render-step failures; espError keeps the first message
 	espError = nil,
 	espHost = nil, -- where the chams folder ended up
+	backend = nil, -- "drawing" | "gui": what boxes, names, skeleton and the FOV circle are drawn with
 }
+
+-- Where the aim point is on screen. With the cursor locked to the middle (BedWars' camera lock) some
+-- executors report a stale or offset GetMouseLocation, which put every enemy outside the FOV circle.
+function State.cursor()
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		local cam = workspace.CurrentCamera
+		if cam then return cam.ViewportSize / 2 end
+	end
+	return UserInputService:GetMouseLocation()
+end
 
 local AIM = {
 	enabled = true,
@@ -10055,8 +10066,136 @@ end
 ----------------------------------------------------------------------
 -- drawing helpers
 ----------------------------------------------------------------------
--- Without a Drawing API the circle and marker become inert stand-ins; the aimlock still works.
+-- Two renderers behind one newDrawing: the executor's Drawing library, or plain Instances (Frames
+-- and TextLabels in a ScreenGui, the same thing the menu and chams already rely on). On Real the
+-- chams and menu showed but every Drawing object stayed invisible -- no boxes, names, skeleton or
+-- FOV circle -- so Drawing is only used where it's known to render (Potassium). Anything else gets
+-- the Instance renderer. getgenv().SHADEED_DRAW = "gui" | "drawing", set before the loader, forces one.
+do
+	local pref = getgenv and getgenv().SHADEED_DRAW
+	local okN, execName = pcall(function() return (identifyexecutor or getexecutorname)() end)
+	execName = okN and tostring(execName):lower() or ""
+	if pref == "gui" then
+		State.backend = "gui"
+	elseif pref == "drawing" and Drawing then
+		State.backend = "drawing"
+	elseif Drawing and execName:find("potassium", 1, true) then
+		State.backend = "drawing"
+	else
+		State.backend = "gui"
+	end
+end
+
+if State.backend == "gui" then
+	local layer = new("ScreenGui", {
+		Name = randomName(), ResetOnSpawn = false, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 998,
+	})
+	if protectgui then pcall(protectgui, layer) end
+	if not pcall(function() layer.Parent = HOST end) or not layer.Parent then layer.Parent = PlayerGui end
+	State.drawLayer = layer
+
+	-- shapes change many properties a frame; they're laid out once, after the ESP step has run
+	local dirty = {}
+	State.drawBind = randomName()
+	RunService:BindToRenderStep(State.drawBind, Enum.RenderPriority.Camera.Value + 3, function()
+		for s in pairs(dirty) do
+			dirty[s] = nil
+			s.layout()
+		end
+	end)
+
+	local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+
+	function State.guiShape(class, props)
+		local s = {
+			Visible = false, Color = WHITE, Thickness = 1, Filled = false, Transparency = 1, ZIndex = 1,
+			Position = Vector2.zero, Size = class == "Text" and 13 or Vector2.zero,
+			From = Vector2.zero, To = Vector2.zero, Radius = 0, Text = "", Center = false,
+			Outline = false, OutlineColor = BLACK, NumSides = 64, Font = 2,
+		}
+		local inst, edge
+		if class == "Text" then
+			inst = new("TextLabel", {
+				BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.new(),
+				Font = Enum.Font.Code, TextWrapped = false, Visible = false, Parent = layer,
+			})
+		else
+			inst = new("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, Parent = layer })
+			edge = new("UIStroke", { ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Enabled = false, Parent = inst })
+			if class == "Circle" then circle().Parent = inst end
+		end
+
+		function s.layout()
+			if not inst.Parent then return end
+			inst.Visible = s.Visible
+			if not s.Visible then return end
+			inst.ZIndex = s.ZIndex
+			local tr = 1 - s.Transparency
+			if class == "Text" then
+				inst.Text = s.Text
+				inst.TextSize = tonumber(s.Size) or 13
+				inst.TextColor3 = s.Color
+				inst.TextTransparency = tr
+				inst.TextStrokeTransparency = s.Outline and 0 or 1
+				inst.TextStrokeColor3 = s.OutlineColor
+				inst.AnchorPoint = s.Center and Vector2.new(0.5, 0) or Vector2.zero
+				inst.Position = UDim2.fromOffset(s.Position.X, s.Position.Y)
+				return
+			end
+			if class == "Line" then
+				local d = s.To - s.From
+				local mid = (s.From + s.To) / 2
+				inst.AnchorPoint = Vector2.new(0.5, 0.5)
+				inst.Position = UDim2.fromOffset(mid.X, mid.Y)
+				inst.Size = UDim2.fromOffset(d.Magnitude, s.Thickness)
+				inst.Rotation = math.deg(math.atan2(d.Y, d.X))
+				inst.BackgroundColor3, inst.BackgroundTransparency = s.Color, tr
+				return
+			end
+			if class == "Circle" then
+				inst.AnchorPoint = Vector2.new(0.5, 0.5)
+				inst.Position = UDim2.fromOffset(s.Position.X, s.Position.Y)
+				inst.Size = UDim2.fromOffset(s.Radius * 2, s.Radius * 2)
+			else
+				inst.Position = UDim2.fromOffset(s.Position.X, s.Position.Y)
+				inst.Size = UDim2.fromOffset(s.Size.X, s.Size.Y)
+			end
+			if s.Filled then
+				edge.Enabled = false
+				inst.BackgroundColor3, inst.BackgroundTransparency = s.Color, tr
+			else
+				inst.BackgroundTransparency = 1
+				edge.Enabled = true
+				edge.Color, edge.Thickness, edge.Transparency = s.Color, s.Thickness, tr
+			end
+		end
+
+		local function remove()
+			dirty[s] = nil
+			inst:Destroy()
+		end
+		for k, v in pairs(props) do s[k] = v end
+		s.layout()
+		return setmetatable({}, {
+			__index = function(_, k)
+				if k == "Remove" or k == "Destroy" then return remove end
+				return s[k]
+			end,
+			__newindex = function(_, k, v)
+				if s[k] == v then return end
+				s[k] = v
+				dirty[s] = true
+			end,
+		})
+	end
+end
+
+-- Without any renderer the circle and marker become inert stand-ins; the aimlock still works.
 local function newDrawing(class, props)
+	if State.backend == "gui" then
+		return State.guiShape(class, props)
+	end
 	if not Drawing then
 		return setmetatable({}, { __index = function() return function() end end })
 	end
@@ -10574,7 +10713,7 @@ end
 local function pickTarget(wantHead)
 	local cam = workspace.CurrentCamera
 	if not cam then return nil end
-	local cursor = UserInputService:GetMouseLocation()
+	local cursor = State.cursor()
 	local origin = myPosition()
 
 	local best, bestPart, bestRoot, bestHum, bestScore
@@ -11273,7 +11412,7 @@ do
 end
 
 local function aimStep()
-	local cursor = UserInputService:GetMouseLocation()
+	local cursor = State.cursor()
 	fovCircle.Position = cursor
 	fovCircle.Radius = AIM.fov
 	fovCircle.Visible = AIM.enabled and AIM.showFov
@@ -11827,7 +11966,7 @@ slider(espPage, 15, "Max distance", 100, 5000, ESP.maxDistance, " studs", functi
 section(espPage, "Look", 16)
 slider(espPage, 17, "Chams fill", 0, 1, 1 - ESP.chamsFill, "", function(v) ESP.chamsFill = 1 - v end)
 slider(espPage, 18, "Text size", 9, 21, ESP.textSize, " px", function(v) ESP.textSize = math.floor(v + 0.5) end)
-infoBox(espPage, 19, 46, Drawing
+infoBox(espPage, 19, 46, (Drawing or State.backend == "gui")
 	and "Visibility colours: green when you can see them, red behind cover. Team colours: their bed colour."
 	or "This executor has no Drawing API, so boxes, names and tracers are off. Chams still work.")
 
@@ -11884,7 +12023,7 @@ do
 	local okId, name = pcall(function() return (identifyexecutor or getexecutorname)() end)
 	if okId and name then exec = tostring(name) end
 	local function short(s, n) s = tostring(s) return #s > n and s:sub(1, n - 1) .. "…" or s end
-	local envBox = infoBox(infoPage, 6, 150, "")
+	local envBox = infoBox(infoPage, 6, 164, "")
 	-- live, so a failure that only shows up in a match (a Drawing property, a render error) lands here
 	local function refresh()
 		local rejected = {}
@@ -11893,14 +12032,15 @@ do
 		local hookLive = HOOKABLE and Class.calculateImportantLaunchValues == hooked
 		envBox.Text = string.format(
 			"Executor           %s\nLaunch hook        %s\nDrawing            %s\nHidden ui          %s\n"
-				.. "Chams host         %s\nDrawing rejected   %s\nESP errors         %s",
+				.. "Chams host         %s\nDrawing rejected   %s\nESP errors         %s\nRenderer           %s",
 			exec,
 			not HOOKABLE and "not found — join a match" or (hookLive and "installed" or "found, but overwritten"),
 			Drawing and "yes" or "no",
 			HOST_IS_VISIBLE and "NO — ui sits in PlayerGui" or "yes",
 			State.espHost or "NOT in game — chams invisible",
 			#rejected > 0 and short(table.concat(rejected, ", "), 48) or "none",
-			State.espErrors > 0 and (State.espErrors .. " · " .. short(State.espError, 44)) or "none"
+			State.espErrors > 0 and (State.espErrors .. " · " .. short(State.espError, 44)) or "none",
+			State.backend == "gui" and "Instances (GUI)" or "Drawing"
 		)
 	end
 	refresh()
@@ -11935,6 +12075,7 @@ local function unload()
 	end
 	pcall(RunService.UnbindFromRenderStep, RunService, AIM_BIND)
 	pcall(RunService.UnbindFromRenderStep, RunService, ESP_BIND)
+	if State.drawBind then pcall(RunService.UnbindFromRenderStep, RunService, State.drawBind) end
 	if Tune.disconnect then pcall(Tune.disconnect) end
 	pcall(Rapid.stop)
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
@@ -11946,6 +12087,7 @@ local function unload()
 	task.delay(0.28, function()
 		gui:Destroy()
 		espFolder:Destroy()
+		if State.drawLayer then State.drawLayer:Destroy() end
 		if unloadBeacon then unloadBeacon:Destroy() end
 	end)
 	if getgenv then getgenv().__SHADEED_BW = nil end
@@ -12141,7 +12283,7 @@ task.spawn(function()
 	if not HOOKABLE then
 		notify("No projectile controller here — run it inside a match", T.danger, 5)
 	end
-	if not Drawing then
+	if not Drawing and State.backend ~= "gui" then
 		notify("No Drawing API — FOV circle off, the aimlock still works", T.warn, 5)
 	end
 end)
